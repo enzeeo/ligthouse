@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>LIGHTHOUSE Storage Analyst</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>LIGHTHOUSE <span>| Storage Analyst</span></h1>
+          <div class="safety-chips" aria-label="Safety mode">
+            <span>READ ONLY</span>
+            <span>LOCAL ONLY</span>
+            <span>NO DELETE</span>
+          </div>
+        </div>
+        <div class="actions">
+          <button id="export-button" class="button secondary" type="button">Export Report</button>
+          <button id="scan-button" class="button primary" type="button">Scan</button>
+        </div>
+      </header>
+
+      <nav class="tabs" aria-label="Dashboard sections">
+        <button class="tab active" type="button" data-tab="overview">Overview</button>
+        <button class="tab" type="button" data-tab="review">Review</button>
+        <button class="tab" type="button" data-tab="files">Files</button>
+        <button class="tab" type="button" data-tab="folders">Folders</button>
+        <button class="tab" type="button" data-tab="growth">Growth</button>
+        <button class="tab" type="button" data-tab="log">Log</button>
+      </nav>
+
+      <section id="message" class="message" aria-live="polite"></section>
+
+      <section id="overview" class="screen active" aria-label="Overview"></section>
+      <section id="review" class="screen" aria-label="Review"></section>
+      <section id="files" class="screen" aria-label="Files"></section>
+      <section id="folders" class="screen" aria-label="Folders"></section>
+      <section id="growth" class="screen" aria-label="Growth"></section>
+      <section id="log" class="screen" aria-label="Log"></section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
