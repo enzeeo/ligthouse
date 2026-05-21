@@ -1,3 +1,4 @@
+from dataclasses import replace
 import signal
 import unittest
 from unittest.mock import patch
@@ -154,11 +155,43 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(tui.map_key(ord("q"), curses).name, "quit")
         self.assertEqual(tui.map_key(ord("r"), curses).name, "refresh")
         self.assertEqual(tui.map_key(ord("3"), curses), tui.InputAction("tab", "files"))
+        self.assertEqual(tui.map_key(9, curses).name, "next_tab")
+        self.assertEqual(tui.map_key(curses.KEY_RIGHT, curses).name, "next_tab")
+        self.assertEqual(tui.map_key(curses.KEY_LEFT, curses).name, "previous_tab")
+        self.assertEqual(tui.map_key(curses.KEY_BTAB, curses).name, "previous_tab")
         self.assertEqual(tui.map_key(curses.KEY_DOWN, curses).name, "down")
         self.assertEqual(tui.map_key(curses.KEY_UP, curses).name, "up")
         self.assertEqual(tui.map_key(curses.KEY_NPAGE, curses).name, "page_down")
         self.assertEqual(tui.map_key(curses.KEY_PPAGE, curses).name, "page_up")
         self.assertEqual(tui.map_key(curses.KEY_MOUSE, curses).name, "mouse")
+
+    def test_tab_cycle_actions_wrap_and_reset_position(self) -> None:
+        state = tui.TuiState(active_tab="overview", scroll=4, selected_index=4, snapshot=SNAPSHOT)
+
+        next_state = tui.reduce_state(state, tui.InputAction("next_tab"))
+        self.assertEqual(next_state.active_tab, "review")
+        self.assertEqual(next_state.scroll, 0)
+        self.assertEqual(next_state.selected_index, 0)
+
+        self.assertEqual(tui.reduce_state(tui.TuiState(active_tab="log"), tui.InputAction("next_tab")).active_tab, "overview")
+        self.assertEqual(
+            tui.reduce_state(tui.TuiState(active_tab="overview"), tui.InputAction("previous_tab")).active_tab,
+            "log",
+        )
+        self.assertEqual(
+            tui.reduce_state(tui.TuiState(active_tab="files"), tui.InputAction("previous_tab")).active_tab,
+            "review",
+        )
+
+    def test_tab_key_during_first_scan_persists_for_snapshot_render(self) -> None:
+        loading = tui.TuiState(status={"status": "running", "phase": "scan"})
+
+        state = tui.reduce_state(loading, tui.map_key(9, FakeCurses()))
+        state = replace(state, snapshot=SNAPSHOT, disk=SNAPSHOT["disk"])
+        rows = tui.render(state, 72, 12)
+
+        self.assertEqual(state.active_tab, "review")
+        self.assertIn("[2 Review]", rows[1])
 
     def test_mouse_mapping_fallback(self) -> None:
         self.assertEqual(tui.map_mouse((0, 16, 1, 0, 0), 60), tui.InputAction("mouse_tab", "review"))
@@ -195,8 +228,11 @@ class TuiTests(unittest.TestCase):
 class FakeCurses:
     KEY_DOWN = 258
     KEY_UP = 259
+    KEY_LEFT = 260
+    KEY_RIGHT = 261
     KEY_NPAGE = 338
     KEY_PPAGE = 339
+    KEY_BTAB = 353
     KEY_MOUSE = 409
     ALL_MOUSE_EVENTS = 1
 

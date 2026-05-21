@@ -153,6 +153,10 @@ def merge_runtime(state: TuiState, runtime: ScanRuntime) -> TuiState:
 def reduce_state(state: TuiState, action: InputAction, width: int = 80, height: int = 24) -> TuiState:
     if action.name == "tab" and action.value in TAB_ORDER:
         return replace(state, active_tab=str(action.value), scroll=0, selected_index=0)
+    if action.name in ("next_tab", "previous_tab"):
+        direction = 1 if action.name == "next_tab" else -1
+        index = TAB_ORDER.index(state.active_tab) if state.active_tab in TAB_ORDER else 0
+        return replace(state, active_tab=TAB_ORDER[(index + direction) % len(TAB_ORDER)], scroll=0, selected_index=0)
     if action.name == "down":
         return replace(state, selected_index=state.selected_index + 1, scroll=state.scroll + 1)
     if action.name == "up":
@@ -184,6 +188,13 @@ def map_key(key: int, curses_module) -> InputAction:
         return InputAction("refresh")
     if ord("1") <= key <= ord("6"):
         return InputAction("tab", TAB_ORDER[key - ord("1")])
+    if key in (9, ord("l"), ord("L")) or key == getattr(curses_module, "KEY_RIGHT", -999):
+        return InputAction("next_tab")
+    if key in (ord("h"), ord("H")) or key in (
+        getattr(curses_module, "KEY_LEFT", -999),
+        getattr(curses_module, "KEY_BTAB", -998),
+    ):
+        return InputAction("previous_tab")
     if key in (10, 13):
         return InputAction("select")
     if key == curses_module.KEY_DOWN:
