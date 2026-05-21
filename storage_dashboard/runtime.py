@@ -1,0 +1,328 @@
+"""Shared scan runtime for web and terminal frontends."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import fcntl
+import hashlib
+import inspect
+import json
+from pathlib import Path
+import shutil
+import threading
+
+from storage_dashboard import scanner as filesystem_scanner
+from storage_dashboard.store import SnapshotStore
+
+SNAPSHOT_SCHEMA_VERSION = 1
+DEFAULT_FRESHNESS = timedelta(minutes=15)
+
+
+class ScanAlreadyRunningError(RuntimeError):
+    """Raised when a scan is already active in this process or another one."""
+
+
+class LocalScanner:
+    """Default scanner adapter for app use."""
+
+    def scan(self, progress=None) -> object:
+        return filesystem_scanner.scan(progress=progress)
+
+
+@dataclass(frozen=True)
+class ScanStart:
+    """Background scan start result."""
+
+    status: str
+    thread: threading.Thread | None = None
+
+
+class AdvisoryScanLock:
+    """Small Unix advisory lock around expensive filesystem scans."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._file = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        file = self.path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            file.close()
+            return False
+        self._file = file
+        return True
+
+    def release(self) -> None:
+        if self._file is None:
+            return
+        try:
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._file.close()
+            self._file = None
+
+
+class ScanRuntime:
+    """Shared status, freshness, locking, and snapshot persistence path."""
+
+    def __init__(
+        self,
+        *,
+        store: SnapshotStore | None = None,
+        scanner: object | None = None,
+        disk_path: Path | None = None,
+        roots: tuple[Path, ...] = filesystem_scanner.DEFAULT_ROOTS,
+        freshness: timedelta = DEFAULT_FRESHNESS,
+        lock_path: Path | None = None,
+    ) -> None:
+        self.store = store or SnapshotStore()
+        self.scanner = scanner or LocalScanner()
+        self.disk_path = disk_path or Path.home()
+        self.roots = tuple(Path(root).expanduser() for root in roots)
+        self.freshness = freshness
+        self.lock_path = lock_path or self.store.path.parent / ".scan.lock"
+        self._scan_lock = threading.Lock()
+        self._status_lock = threading.Lock()
+        self._status: dict[str, object] = self._base_status()
+
+    @property
+    def roots_fingerprint(self) -> str:
+        return roots_fingerprint(self.roots)
+
+    def disk_summary(self) -> dict[str, object]:
+        usage = shutil.disk_usage(self.disk_path)
+        percent = 0.0 if usage.total == 0 else round((usage.used / usage.total) * 100, 1)
+        return {
+            "total": usage.total,
+            "used": usage.used,
+            "free": usage.free,
+            "percent": percent,
+        }
+
+    def scan_status(self) -> dict[str, object]:
+        with self._status_lock:
+            status = dict(self._status)
+        latest = self.store.latest()
+        if latest is not None:
+            status["latest_snapshot"] = {
+                "id": latest.get("id"),
+                "timestamp": latest.get("timestamp"),
+            }
+        return status
+
+    def latest_compatible_snapshot(self) -> dict[str, object] | None:
+        latest = self.store.latest()
+        if self.is_compatible(latest):
+            return latest
+        return None
+
+    def is_compatible(self, snapshot: dict[str, object] | None) -> bool:
+        if not isinstance(snapshot, dict):
+            return False
+        return (
+            snapshot.get("schema_version") == SNAPSHOT_SCHEMA_VERSION
+            and snapshot.get("roots_fingerprint") == self.roots_fingerprint
+        )
+
+    def snapshot_age(self, snapshot: dict[str, object] | None) -> timedelta | None:
+        if not isinstance(snapshot, dict):
+            return None
+        timestamp = snapshot.get("timestamp")
+        if not isinstance(timestamp, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(timestamp)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)
+
+    def has_fresh_compatible_snapshot(self) -> bool:
+        snapshot = self.latest_compatible_snapshot()
+        age = self.snapshot_age(snapshot)
+        return age is not None and age <= self.freshness
+
+    def ensure_fresh_background(self) -> ScanStart:
+        if self.has_fresh_compatible_snapshot():
+            return ScanStart("fresh")
+        return self.start_background_scan()
+
+    def start_background_scan(self) -> ScanStart:
+        if self.scan_status().get("status") == "running":
+            return ScanStart("running")
+
+        def target() -> None:
+            try:
+                self.run_scan()
+            except ScanAlreadyRunningError:
+                return
+            except Exception:
+                return
+
+        thread = threading.Thread(target=target, name="lighthouse-scan", daemon=True)
+        thread.start()
+        return ScanStart("started", thread)
+
+    def run_scan(self) -> dict[str, object]:
+        if not self._scan_lock.acquire(blocking=False):
+            raise ScanAlreadyRunningError("scan already running")
+        advisory_lock = AdvisoryScanLock(self.lock_path)
+        if not advisory_lock.acquire():
+            self._scan_lock.release()
+            raise ScanAlreadyRunningError("scan already running")
+
+        self._set_status(
+            status="running",
+            phase="starting",
+            active_root=None,
+            active_path=None,
+            completed_roots=[],
+            pending_roots=[str(root) for root in self.roots],
+            entries_seen=0,
+            logs_seen=0,
+            started_at=_utc_now(),
+            finished_at=None,
+            snapshot_id=None,
+            error=None,
+        )
+        try:
+            result = self._run_scanner()
+            entries = entries_from_result(result)
+            logs = logs_from_result(result)
+            roots = roots_from_entries(entries, default_roots=self.roots)
+            snapshot = self.store.add_snapshot(
+                roots=roots,
+                disk=self.disk_summary(),
+                entries=entries,
+                logs=logs,
+                schema_version=SNAPSHOT_SCHEMA_VERSION,
+                roots_fingerprint=self.roots_fingerprint,
+            )
+            self._set_status(
+                status="completed",
+                phase="complete",
+                active_root=None,
+                active_path=None,
+                pending_roots=[],
+                entries_seen=len(entries),
+                logs_seen=len(logs),
+                finished_at=_utc_now(),
+                snapshot_id=snapshot["id"],
+                error=None,
+            )
+            return snapshot
+        except Exception:
+            self._set_status(status="failed", phase="failed", error="scan_failed", finished_at=_utc_now())
+            raise
+        finally:
+            advisory_lock.release()
+            self._scan_lock.release()
+
+    def _run_scanner(self) -> object:
+        scan = self.scanner.scan
+        parameters = inspect.signature(scan).parameters
+        accepts_progress = "progress" in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        )
+        if accepts_progress:
+            return scan(progress=self._update_scan_progress)
+        return scan()
+
+    def _update_scan_progress(self, progress: dict[str, object]) -> None:
+        allowed = {
+            "phase",
+            "active_root",
+            "active_path",
+            "completed_roots",
+            "pending_roots",
+            "entries_seen",
+            "logs_seen",
+        }
+        update = {key: progress[key] for key in allowed if key in progress}
+        for key in ("completed_roots", "pending_roots"):
+            if key in update and isinstance(update[key], list):
+                update[key] = list(update[key])
+        update["status"] = "running"
+        self._set_status(**update)
+
+    def _set_status(self, **updates: object) -> None:
+        with self._status_lock:
+            status = dict(self._status)
+            status.update(updates)
+            self._status = status
+
+    def _base_status(self) -> dict[str, object]:
+        return {
+            "status": "idle",
+            "phase": "idle",
+            "active_root": None,
+            "active_path": None,
+            "completed_roots": [],
+            "pending_roots": [],
+            "entries_seen": 0,
+            "logs_seen": 0,
+            "started_at": None,
+            "finished_at": None,
+            "snapshot_id": None,
+            "error": None,
+        }
+
+
+def roots_fingerprint(roots: tuple[Path, ...]) -> str:
+    payload = json.dumps([str(Path(root).expanduser()) for root in roots], separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def entries_from_result(result: object) -> list[dict[str, object]]:
+    if isinstance(result, dict):
+        entries = result.get("entries", [])
+    else:
+        entries = getattr(result, "entries", [])
+    return [entry_to_dict(entry) for entry in entries]
+
+
+def logs_from_result(result: object) -> list[dict[str, object]]:
+    if isinstance(result, dict):
+        logs = result.get("logs", [])
+    else:
+        logs = getattr(result, "logs", [])
+    return [log_to_dict(log) for log in logs]
+
+
+def entry_to_dict(entry: object) -> dict[str, object]:
+    if isinstance(entry, dict):
+        return dict(entry)
+    to_dict = getattr(entry, "to_dict", None)
+    if callable(to_dict):
+        return to_dict()
+    return {}
+
+
+def log_to_dict(log: object) -> dict[str, object]:
+    if isinstance(log, dict):
+        return dict(log)
+    return {
+        "path": str(getattr(log, "path", "")),
+        "event": str(getattr(log, "event", "")),
+        "message": str(getattr(log, "message", "")),
+    }
+
+
+def roots_from_entries(entries: list[dict[str, object]], *, default_roots: tuple[Path, ...]) -> list[str]:
+    roots = []
+    for entry in entries:
+        root = entry.get("root")
+        if root is not None and str(root) not in roots:
+            roots.append(str(root))
+    if roots:
+        return roots
+    return [str(root) for root in default_roots]

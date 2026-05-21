@@ -5,10 +5,11 @@ Local-only storage dashboard.
 ## Run
 
 ```sh
-python3 app.py
+python3 -m pip install -e .
+lighthouse
 ```
 
-Then open `http://127.0.0.1:8765`.
+Use `lighthouse web` to run the browser dashboard at `http://127.0.0.1:8765`.
 
 ## Test
 
@@ -20,5 +21,7 @@ python3 -m unittest
 
 - Backend uses Python standard library only.
 - Frontend uses vanilla HTML, CSS, and JavaScript only.
-- Dashboard is a sparse btop-style web UI for overview, review, file, folder, growth, and scanner log views.
+- `lighthouse` opens a sparse btop-style terminal UI for overview, review, file, folder, growth, and scanner log views.
+- `lighthouse web` preserves the browser dashboard.
+- Cached compatible snapshots render first; stale or missing cache starts a background scan.
 - It is read-only: no delete or filesystem-mutating controls are exposed.

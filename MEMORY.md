@@ -33,3 +33,10 @@
 - Decided: `create_server()` accepts only the exact host `127.0.0.1`; it rejects `localhost`, `::1`, `0.0.0.0`, and other hosts.
 - Why: The implementation plan required binding to `127.0.0.1` only, not broader loopback aliases.
 - Rejected: Treating `localhost` or IPv6 loopback as equivalent in v1.
+
+### 2026-05-21 - Lighthouse TUI Default
+- Decided: Add `lighthouse = storage_dashboard.cli:main`; default command opens the curses TUI, while `lighthouse web` keeps the browser dashboard.
+- Decided: Share scan/status/snapshot behavior through `ScanRuntime` with schema version, roots fingerprint, and an advisory scan lock.
+- Decided: Keep the TUI stdlib-only, read-only, keyboard-first, and backed by compatible cached snapshots plus background refresh when stale.
+- Why: Gives the requested btop-style terminal app without adding dependencies or duplicating scanner/store behavior.
+- Rejected: Constant scanning, destructive file actions, Windows TUI support in v1, and a separate growth data store.

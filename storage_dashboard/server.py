@@ -3,34 +3,19 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import errno
-import inspect
 import json
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-import shutil
 import sys
-import threading
 from urllib.parse import urlparse
 
-from storage_dashboard import scanner as filesystem_scanner
+from storage_dashboard.runtime import LocalScanner, ScanAlreadyRunningError, ScanRuntime
 from storage_dashboard.store import SnapshotStore
 
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 ALLOWED_HOST = "127.0.0.1"
 SUGGESTION_CLASSES = {"safe_to_review": 0, "caution": 1}
-
-
-class ScanAlreadyRunningError(RuntimeError):
-    """Raised when a second scan starts before the current scan finishes."""
-
-
-class LocalScanner:
-    """Default scanner adapter for API use."""
-
-    def scan(self, progress=None) -> object:
-        return filesystem_scanner.scan(progress=progress)
 
 
 class DashboardRequestHandler(SimpleHTTPRequestHandler):
@@ -153,135 +138,23 @@ class DashboardServer(ThreadingHTTPServer):
         store: SnapshotStore,
         scanner: object,
         disk_path: Path,
+        runtime: ScanRuntime | None = None,
     ) -> None:
         super().__init__(server_address, handler_class)
-        self.store = store
-        self.scanner = scanner
-        self.disk_path = disk_path
-        self._scan_lock = threading.Lock()
-        self._status_lock = threading.Lock()
-        self._status: dict[str, object] = self._base_status()
+        self.runtime = runtime or ScanRuntime(store=store, scanner=scanner, disk_path=disk_path)
+        self.store = self.runtime.store
+        self.scanner = self.runtime.scanner
+        self.disk_path = self.runtime.disk_path
+        self._scan_lock = self.runtime._scan_lock
 
     def disk_summary(self) -> dict[str, object]:
-        usage = shutil.disk_usage(self.disk_path)
-        percent = 0.0 if usage.total == 0 else round((usage.used / usage.total) * 100, 1)
-        return {
-            "total": usage.total,
-            "used": usage.used,
-            "free": usage.free,
-            "percent": percent,
-        }
+        return self.runtime.disk_summary()
 
     def scan_status(self) -> dict[str, object]:
-        with self._status_lock:
-            status = dict(self._status)
-        latest = self.store.latest()
-        if latest is not None:
-            status["latest_snapshot"] = {
-                "id": latest.get("id"),
-                "timestamp": latest.get("timestamp"),
-            }
-        return status
+        return self.runtime.scan_status()
 
     def run_scan(self) -> dict[str, object]:
-        if not self._scan_lock.acquire(blocking=False):
-            raise ScanAlreadyRunningError("scan already running")
-        self._set_status(
-            status="running",
-            phase="starting",
-            active_root=None,
-            active_path=None,
-            completed_roots=[],
-            pending_roots=[str(root) for root in filesystem_scanner.DEFAULT_ROOTS],
-            entries_seen=0,
-            logs_seen=0,
-            started_at=_utc_now(),
-            finished_at=None,
-            snapshot_id=None,
-            error=None,
-        )
-        try:
-            result = self._run_scanner()
-            entries = _entries_from_result(result)
-            logs = _logs_from_result(result)
-            roots = _roots_from_entries(entries)
-            snapshot = self.store.add_snapshot(
-                roots=roots,
-                disk=self.disk_summary(),
-                entries=entries,
-                logs=logs,
-            )
-            self._set_status(
-                status="completed",
-                phase="complete",
-                active_root=None,
-                active_path=None,
-                pending_roots=[],
-                entries_seen=len(entries),
-                logs_seen=len(logs),
-                finished_at=_utc_now(),
-                snapshot_id=snapshot["id"],
-                error=None,
-            )
-            return snapshot
-        except Exception:
-            self._set_status(status="failed", phase="failed", error="scan_failed", finished_at=_utc_now())
-            raise
-        finally:
-            self._scan_lock.release()
-
-    def _run_scanner(self) -> object:
-        scan = self.scanner.scan
-        parameters = inspect.signature(scan).parameters
-        accepts_progress = "progress" in parameters or any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
-        )
-        if accepts_progress:
-            return scan(progress=self._update_scan_progress)
-        return scan()
-
-    def _update_scan_progress(self, progress: dict[str, object]) -> None:
-        allowed = {
-            "phase",
-            "active_root",
-            "active_path",
-            "completed_roots",
-            "pending_roots",
-            "entries_seen",
-            "logs_seen",
-        }
-        update = {key: progress[key] for key in allowed if key in progress}
-        for key in ("completed_roots", "pending_roots"):
-            if key in update and isinstance(update[key], list):
-                update[key] = list(update[key])
-        update["status"] = "running"
-        self._set_status(**update)
-
-    def _set_status(self, **updates: object) -> None:
-        with self._status_lock:
-            status = dict(self._status)
-            status.update(updates)
-            self._status = status
-
-    def _base_status(self) -> dict[str, object]:
-        return {
-            "status": "idle",
-            "phase": "idle",
-            "active_root": None,
-            "active_path": None,
-            "completed_roots": [],
-            "pending_roots": [],
-            "entries_seen": 0,
-            "logs_seen": 0,
-            "started_at": None,
-            "finished_at": None,
-            "snapshot_id": None,
-            "error": None,
-        }
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+        return self.runtime.run_scan()
 
 
 def create_server(
@@ -291,6 +164,7 @@ def create_server(
     store: SnapshotStore | None = None,
     scanner: object | None = None,
     disk_path: Path | None = None,
+    runtime: ScanRuntime | None = None,
 ) -> DashboardServer:
     """Create a dashboard server bound to the approved IPv4 loopback host."""
 
@@ -303,6 +177,7 @@ def create_server(
         store=store or SnapshotStore(),
         scanner=scanner or LocalScanner(),
         disk_path=disk_path or Path.home(),
+        runtime=runtime,
     )
 
 
@@ -348,52 +223,6 @@ def _coerce_size_bytes(value: object) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
-
-
-def _entries_from_result(result: object) -> list[dict[str, object]]:
-    if isinstance(result, dict):
-        entries = result.get("entries", [])
-    else:
-        entries = getattr(result, "entries", [])
-    return [_entry_to_dict(entry) for entry in entries]
-
-
-def _logs_from_result(result: object) -> list[dict[str, object]]:
-    if isinstance(result, dict):
-        logs = result.get("logs", [])
-    else:
-        logs = getattr(result, "logs", [])
-    return [_log_to_dict(log) for log in logs]
-
-
-def _entry_to_dict(entry: object) -> dict[str, object]:
-    if isinstance(entry, dict):
-        return dict(entry)
-    to_dict = getattr(entry, "to_dict", None)
-    if callable(to_dict):
-        return to_dict()
-    return {}
-
-
-def _log_to_dict(log: object) -> dict[str, object]:
-    if isinstance(log, dict):
-        return dict(log)
-    return {
-        "path": str(getattr(log, "path", "")),
-        "event": str(getattr(log, "event", "")),
-        "message": str(getattr(log, "message", "")),
-    }
-
-
-def _roots_from_entries(entries: list[dict[str, object]]) -> list[str]:
-    roots = []
-    for entry in entries:
-        root = entry.get("root")
-        if root is not None and str(root) not in roots:
-            roots.append(str(root))
-    if roots:
-        return roots
-    return [str(root) for root in filesystem_scanner.DEFAULT_ROOTS]
 
 
 def run(host: str = "127.0.0.1", port: int = 8765) -> None:

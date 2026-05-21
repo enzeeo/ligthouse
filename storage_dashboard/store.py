@@ -64,6 +64,8 @@ class SnapshotStore:
         disk: dict[str, object],
         entries: list[dict[str, object]],
         logs: list[dict[str, object]],
+        schema_version: int | None = None,
+        roots_fingerprint: str | None = None,
     ) -> dict[str, object]:
         with self._lock:
             data = self._load_unlocked()
@@ -77,6 +79,10 @@ class SnapshotStore:
                 "entries": entries,
                 "logs": logs,
             }
+            if schema_version is not None:
+                snapshot["schema_version"] = schema_version
+            if roots_fingerprint is not None:
+                snapshot["roots_fingerprint"] = roots_fingerprint
             snapshots.append(snapshot)
             data["snapshots"] = snapshots[-self.limit :]
             self.path.parent.mkdir(parents=True, exist_ok=True)
