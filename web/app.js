@@ -17,7 +17,11 @@ const state = {
   suggestions: [],
   selectedPath: "",
   history: loadHistory(),
+  scanFrame: 0,
 };
+
+let scanStatusTimer = null;
+let scanStatusRequestRunning = false;
 
 const screens = Object.fromEntries(
   Array.from(document.querySelectorAll(".screen")).map((screen) => [screen.id, screen])
@@ -54,7 +58,7 @@ async function refreshAll() {
     state.disk = disk.value;
   }
   if (status.status === "fulfilled") {
-    state.status = status.value;
+    state.status = { ...scanProgressDefaults(), ...status.value };
   }
   if (results.status === "fulfilled") {
     applyResults(results.value);
@@ -86,7 +90,15 @@ async function refreshAll() {
 async function runScan() {
   setNotice("Scan running. Read-only metadata only.");
   scanButton.disabled = true;
-  state.status = { status: "running" };
+  state.status = {
+    ...scanProgressDefaults(),
+    ...state.status,
+    status: "running",
+    phase: "starting",
+    started_at: new Date().toISOString(),
+    finished_at: null,
+  };
+  startScanStatusPolling();
   render();
 
   try {
@@ -97,11 +109,41 @@ async function runScan() {
     await refreshAll();
     setNotice("Scan complete.");
   } catch (error) {
-    state.status = { status: "failed", error: "scan_failed" };
+    state.status = { ...scanProgressDefaults(), ...state.status, status: "failed", phase: "failed", error: "scan_failed" };
     setNotice(`Scan failed: ${error.message}`);
     render();
   } finally {
-    scanButton.disabled = false;
+    stopScanStatusPolling();
+    syncScanControls();
+  }
+}
+
+function startScanStatusPolling() {
+  stopScanStatusPolling();
+  scanStatusTimer = window.setInterval(refreshScanStatus, 350);
+}
+
+function stopScanStatusPolling() {
+  if (scanStatusTimer !== null) {
+    window.clearInterval(scanStatusTimer);
+    scanStatusTimer = null;
+  }
+}
+
+async function refreshScanStatus() {
+  if (scanStatusRequestRunning) {
+    return;
+  }
+  scanStatusRequestRunning = true;
+  try {
+    const status = await getJson(API.status);
+    state.status = status;
+    state.scanFrame += 1;
+    render();
+  } catch (error) {
+    setNotice(`Scan status unavailable: ${error.message}`);
+  } finally {
+    scanStatusRequestRunning = false;
   }
 }
 
@@ -177,6 +219,7 @@ function render() {
   screens.growth.innerHTML = renderGrowth();
   screens.log.innerHTML = renderLog();
   bindRenderedEvents();
+  syncScanControls();
 }
 
 function renderOverview() {
@@ -214,6 +257,7 @@ function renderOverview() {
         ${roots.length ? roots.map((root) => meter(root.path, root.percent, formatBytes(root.size), "green")).join("") : empty("No scan yet. Run Scan to populate root meters.")}
       </div>
     </article>
+    ${renderScanDebug(roots)}
   `;
 }
 
@@ -325,7 +369,7 @@ function renderGrowth() {
     <article class="panel">
       <div class="panel-head"><h2>Trend</h2><span>${history.length} local samples</span></div>
       <div class="panel-body">
-        <div class="mini-bars">${history.map((item) => `<div class="mini-bar" title="${escapeAttr(item.timestamp)}" style="height:${Math.max(8, (item.totalBytes / max) * 120)}px"></div>`).join("")}</div>
+        ${tuiTrend(history, max)}
       </div>
     </article>
     <article class="panel">
@@ -434,17 +478,85 @@ function renderDetail(item) {
   `;
 }
 
+function renderScanDebug(roots) {
+  const status = { ...scanProgressDefaults(), ...(state.status || {}) };
+  const scanStatus = String(status.status || "idle");
+  const activePath = status.active_path || status.active_root || "waiting for scan";
+  const phase = status.phase || scanStatus;
+  const rootRows = scanDebugRoots(status, roots);
+  const recentLogs = state.logs.slice(-4).reverse();
+  return `
+    <article class="panel wide scan-debug">
+      <div class="panel-head">
+        <h2>Scan Debug</h2>
+        <span class="${statusClass(scanStatus)}">${escapeHtml(scanStatus.toUpperCase())}</span>
+      </div>
+      <div class="panel-body stack">
+        <div class="debug-toolbar">
+          <button class="button primary" type="button" data-run-scan ${scanStatus === "running" ? "disabled" : ""}>Scan</button>
+          <span>${escapeHtml(String(phase).toUpperCase())}</span>
+        </div>
+        <div class="debug-line">
+          <span class="debug-label">active</span>
+          <span class="scan-marker ${scanStatus === "running" ? "running" : ""}">${escapeHtml(scanMarker(scanStatus))}</span>
+          <span class="debug-path">${escapeHtml(activePath)}</span>
+        </div>
+        <div class="debug-grid">
+          <div><span class="debug-label">entries</span><strong>${number(status.entries_seen)}</strong></div>
+          <div><span class="debug-label">events</span><strong>${number(status.logs_seen)}</strong></div>
+          <div><span class="debug-label">started</span><strong>${escapeHtml(shortTime(status.started_at))}</strong></div>
+          <div><span class="debug-label">finished</span><strong>${escapeHtml(shortTime(status.finished_at))}</strong></div>
+        </div>
+        <div class="debug-roots">
+          ${rootRows.length ? rootRows.map(renderScanRootRow).join("") : empty("No roots queued yet. Press Scan to start a debug trace.")}
+        </div>
+        ${
+          recentLogs.length
+            ? `<div class="debug-events">${recentLogs.map((log) => `<div><span>${escapeHtml(log.event || "event")}</span><span>${escapeHtml(log.path || "")}</span></div>`).join("")}</div>`
+            : ""
+        }
+      </div>
+    </article>
+  `;
+}
+
+function renderScanRootRow(row) {
+  return `
+    <div class="debug-root ${escapeAttr(row.state)}">
+      <span>${escapeHtml(row.marker)}</span>
+      <span>${escapeHtml(row.path)}</span>
+      <span>${escapeHtml(row.state)}</span>
+    </div>
+  `;
+}
+
 function meter(label, percent, value, color) {
   const safePercent = Math.max(0, Math.min(100, Number.isFinite(percent) ? percent : 0));
-  const active = Math.round((safePercent / 100) * 24);
-  const segments = Array.from({ length: 24 }, (_, index) => {
-    const on = index < active ? ` on ${color}` : "";
-    return `<span class="segment${on}"></span>`;
-  }).join("");
+  const active = Math.round((safePercent / 100) * 20);
+  const bar = `${"█".repeat(active)}${"·".repeat(20 - active)}`;
   return `
     <div class="meter">
       ${label || value ? `<div class="meter-top"><span>${escapeHtml(label)}</span><span>${escapeHtml(value)}</span></div>` : ""}
-      <div class="segments" aria-label="${escapeAttr(label)} meter">${segments}</div>
+      <div class="tui-meter ${escapeAttr(color)}" aria-label="${escapeAttr(label)} meter">
+        <span>[</span><span>${bar}</span><span>]</span>
+      </div>
+    </div>
+  `;
+}
+
+function tuiTrend(history, max) {
+  return `
+    <div class="tui-bars">
+      ${history
+        .map((item) => {
+          const active = Math.max(1, Math.round((item.totalBytes / max) * 8));
+          const cells = Array.from({ length: 8 }, (_, index) => {
+            const on = index >= 8 - active;
+            return `<span class="${on ? "on" : ""}">${on ? "█" : "·"}</span>`;
+          }).join("");
+          return `<div class="tui-vbar" title="${escapeAttr(item.timestamp)}">${cells}</div>`;
+        })
+        .join("")}
     </div>
   `;
 }
@@ -454,6 +566,9 @@ function empty(text) {
 }
 
 function bindRenderedEvents() {
+  document.querySelectorAll("[data-run-scan]").forEach((button) => {
+    button.addEventListener("click", runScan);
+  });
   document.querySelectorAll("[data-select-path]").forEach((button) => {
     button.addEventListener("click", () => {
       state.selectedPath = button.dataset.selectPath || "";
@@ -462,6 +577,14 @@ function bindRenderedEvents() {
   });
   document.querySelectorAll("[data-copy-path]").forEach((button) => {
     button.addEventListener("click", () => copyPath(button.dataset.copyPath || ""));
+  });
+}
+
+function syncScanControls() {
+  const running = state.status && state.status.status === "running";
+  scanButton.disabled = running;
+  document.querySelectorAll("[data-run-scan]").forEach((button) => {
+    button.disabled = running;
   });
 }
 
@@ -516,6 +639,63 @@ function logCounts(logs) {
     permission: (permissionCount / total) * 100,
     permissionCount,
   };
+}
+
+function scanDebugRoots(status, roots) {
+  const completed = new Set(arrayOfStrings(status.completed_roots));
+  const pending = arrayOfStrings(status.pending_roots);
+  const activeRoot = String(status.active_root || "");
+  const ordered = [];
+  [...completed, activeRoot, ...pending, ...roots.map((root) => root.path)].forEach((path) => {
+    if (path && !ordered.includes(path)) {
+      ordered.push(path);
+    }
+  });
+  return ordered.map((path) => {
+    if (path === activeRoot && status.status === "running") {
+      return { path, state: "scanning", marker: scanMarker("running") };
+    }
+    if (completed.has(path)) {
+      return { path, state: "done", marker: "█████" };
+    }
+    return { path, state: "queued", marker: "-----" };
+  });
+}
+
+function scanMarker(status) {
+  if (status !== "running") {
+    return "-----";
+  }
+  return ["-----", "\\\\\\\\\\", "|||||", "/////"][state.scanFrame % 4];
+}
+
+function scanProgressDefaults() {
+  return {
+    phase: "idle",
+    active_root: null,
+    active_path: null,
+    completed_roots: [],
+    pending_roots: [],
+    entries_seen: 0,
+    logs_seen: 0,
+    started_at: null,
+    finished_at: null,
+  };
+}
+
+function arrayOfStrings(value) {
+  return Array.isArray(value) ? value.map((item) => String(item)).filter(Boolean) : [];
+}
+
+function shortTime(value) {
+  if (!value) {
+    return "-";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return String(value);
+  }
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 function rememberSnapshot(snapshot) {

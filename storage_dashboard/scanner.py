@@ -7,8 +7,11 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import stat
+from typing import Callable
 
 from storage_dashboard.classifier import SOURCE_MARKERS, Classification, classify_path
+
+ProgressCallback = Callable[[dict[str, object]], None]
 
 DEFAULT_ROOTS = (
     Path.home() / "Downloads",
@@ -106,7 +109,7 @@ def normalize_roots(roots: tuple[str | Path, ...]) -> tuple[Path, ...]:
     return tuple(Path(root).expanduser() for root in roots)
 
 
-def scan(options: ScanOptions | None = None) -> ScanResult:
+def scan(options: ScanOptions | None = None, progress: ProgressCallback | None = None) -> ScanResult:
     """Scan configured roots without modifying filesystem state."""
 
     options = options or ScanOptions()
@@ -115,16 +118,72 @@ def scan(options: ScanOptions | None = None) -> ScanResult:
 
     entries: list[ScanEntry] = []
     logs: list[ScanLog] = []
+    roots = normalize_roots(tuple(options.roots))
+    completed_roots: list[str] = []
 
-    for root in normalize_roots(tuple(options.roots)):
+    _emit_progress(
+        progress,
+        phase="starting",
+        active_root=None,
+        active_path=None,
+        completed_roots=list(completed_roots),
+        pending_roots=[str(root) for root in roots],
+        entries_seen=0,
+        logs_seen=0,
+    )
+
+    for index, root in enumerate(roots):
+        _emit_progress(
+            progress,
+            phase="root",
+            active_root=str(root),
+            active_path=str(root),
+            completed_roots=list(completed_roots),
+            pending_roots=[str(item) for item in roots[index:]],
+            entries_seen=len(entries),
+            logs_seen=len(logs),
+        )
         if _is_denied(root, options.denied_roots):
             entries.append(_denied_entry(root))
             logs.append(ScanLog(root, "denied_root", "Skipped denied root."))
+            completed_roots.append(str(root))
+            _emit_progress(
+                progress,
+                phase="root_complete",
+                active_root=str(root),
+                active_path=str(root),
+                completed_roots=list(completed_roots),
+                pending_roots=[str(item) for item in roots[index + 1 :]],
+                entries_seen=len(entries),
+                logs_seen=len(logs),
+            )
             continue
 
-        entry = _scan_path(root, root, options, logs)
+        entry = _scan_path(root, root, options, logs, progress)
         if entry is not None:
             entries.extend(entry)
+        completed_roots.append(str(root))
+        _emit_progress(
+            progress,
+            phase="root_complete",
+            active_root=str(root),
+            active_path=str(root),
+            completed_roots=list(completed_roots),
+            pending_roots=[str(item) for item in roots[index + 1 :]],
+            entries_seen=len(entries),
+            logs_seen=len(logs),
+        )
+
+    _emit_progress(
+        progress,
+        phase="complete",
+        active_root=None,
+        active_path=None,
+        completed_roots=list(completed_roots),
+        pending_roots=[],
+        entries_seen=len(entries),
+        logs_seen=len(logs),
+    )
 
     return ScanResult(tuple(entries), tuple(logs))
 
@@ -134,7 +193,9 @@ def _scan_path(
     root: Path,
     options: ScanOptions,
     logs: list[ScanLog],
+    progress: ProgressCallback | None = None,
 ) -> list[ScanEntry] | None:
+    _emit_path_progress(progress, "checking", path, root, logs)
     if _is_denied(path, options.denied_roots):
         logs.append(ScanLog(path, "denied_root", "Skipped denied path."))
         return [_denied_entry(path, root=root)]
@@ -148,14 +209,16 @@ def _scan_path(
         return None
 
     if stat.S_ISDIR(stat_result.st_mode):
+        _emit_path_progress(progress, "directory", path, root, logs)
         directory_fd = _open_directory_path(path, logs)
         if directory_fd is None:
             return None
         try:
-            return _scan_directory(path, root, stat_result.st_mtime, directory_fd, options, logs)
+            return _scan_directory(path, root, stat_result.st_mtime, directory_fd, options, logs, progress)
         finally:
             os.close(directory_fd)
 
+    _emit_path_progress(progress, "file", path, root, logs)
     modified_at = _datetime_modified(stat_result.st_mtime)
     classification = classify_path(
         path,
@@ -184,13 +247,15 @@ def _scan_directory(
     directory_fd: int,
     options: ScanOptions,
     logs: list[ScanLog],
+    progress: ProgressCallback | None = None,
 ) -> list[ScanEntry]:
+    _emit_path_progress(progress, "directory", path, root, logs)
     child_entries: list[ScanEntry] = []
     size_bytes = 0
     file_count = 0
 
     if path.name in options.excluded_names:
-        size_bytes, file_count = _measure_directory(path, directory_fd, options, logs)
+        size_bytes, file_count = _measure_directory(path, directory_fd, options, logs, progress, root)
         modified_at = _datetime_modified(modified_timestamp)
         classification = classify_path(
             path,
@@ -216,7 +281,7 @@ def _scan_directory(
 
     for child_name in children:
         child_path = path / child_name
-        scanned = _scan_child(child_name, child_path, root, directory_fd, options, logs)
+        scanned = _scan_child(child_name, child_path, root, directory_fd, options, logs, progress)
         if scanned is None:
             continue
         child_entries.extend(scanned)
@@ -304,7 +369,9 @@ def _scan_child(
     parent_fd: int,
     options: ScanOptions,
     logs: list[ScanLog],
+    progress: ProgressCallback | None = None,
 ) -> list[ScanEntry] | None:
+    _emit_path_progress(progress, "checking", child_path, root, logs)
     if _is_denied(child_path, options.denied_roots):
         logs.append(ScanLog(child_path, "denied_root", "Skipped denied path."))
         return [_denied_entry(child_path, root=root)]
@@ -318,14 +385,16 @@ def _scan_child(
         return None
 
     if stat.S_ISDIR(stat_result.st_mode):
+        _emit_path_progress(progress, "directory", child_path, root, logs)
         directory_fd = _open_directory_child(child_name, child_path, parent_fd, logs)
         if directory_fd is None:
             return None
         try:
-            return _scan_directory(child_path, root, stat_result.st_mtime, directory_fd, options, logs)
+            return _scan_directory(child_path, root, stat_result.st_mtime, directory_fd, options, logs, progress)
         finally:
             os.close(directory_fd)
 
+    _emit_path_progress(progress, "file", child_path, root, logs)
     modified_at = _datetime_modified(stat_result.st_mtime)
     classification = classify_path(
         child_path,
@@ -352,12 +421,16 @@ def _measure_directory(
     directory_fd: int,
     options: ScanOptions,
     logs: list[ScanLog],
+    progress: ProgressCallback | None = None,
+    root: Path | None = None,
 ) -> tuple[int, int]:
+    _emit_path_progress(progress, "directory", path, root or path, logs)
     size_bytes = 0
     file_count = 0
 
     for child_name in _list_directory_names(directory_fd, path, logs):
         child_path = path / child_name
+        _emit_path_progress(progress, "checking", child_path, root or path, logs)
         stat_result = _stat_child(child_name, child_path, directory_fd, logs)
         if stat_result is None:
             continue
@@ -371,21 +444,44 @@ def _measure_directory(
             continue
 
         if stat.S_ISDIR(stat_result.st_mode):
+            _emit_path_progress(progress, "directory", child_path, root or path, logs)
             child_fd = _open_directory_child(child_name, child_path, directory_fd, logs)
             if child_fd is None:
                 continue
             try:
-                child_size, child_count = _measure_directory(child_path, child_fd, options, logs)
+                child_size, child_count = _measure_directory(child_path, child_fd, options, logs, progress, root or path)
             finally:
                 os.close(child_fd)
             size_bytes += child_size
             file_count += child_count
             continue
 
+        _emit_path_progress(progress, "file", child_path, root or path, logs)
         size_bytes += stat_result.st_size
         file_count += 1
 
     return size_bytes, file_count
+
+
+def _emit_path_progress(
+    progress: ProgressCallback | None,
+    phase: str,
+    path: Path,
+    root: Path,
+    logs: list[ScanLog],
+) -> None:
+    _emit_progress(
+        progress,
+        phase=phase,
+        active_root=str(root),
+        active_path=str(path),
+        logs_seen=len(logs),
+    )
+
+
+def _emit_progress(progress: ProgressCallback | None, **payload: object) -> None:
+    if progress is not None:
+        progress(payload)
 
 
 def _stat_path(path: Path, logs: list[ScanLog]) -> os.stat_result | None:

@@ -55,6 +55,41 @@ class FailingScanner:
         raise RuntimeError("secret local path /Users/example")
 
 
+class ProgressScanner:
+    def __init__(self) -> None:
+        self.server = None
+        self.observed_status = None
+
+    def scan(self, progress=None):
+        if progress is not None:
+            progress(
+                {
+                    "phase": "directory",
+                    "active_root": "/tmp/root",
+                    "active_path": "/tmp/root/project",
+                    "completed_roots": [],
+                    "pending_roots": ["/tmp/root"],
+                    "entries_seen": 4,
+                    "logs_seen": 1,
+                }
+            )
+        self.observed_status = self.server.scan_status()
+        return {
+            "entries": [
+                {
+                    "path": "/tmp/root/project",
+                    "kind": "folder",
+                    "size_bytes": 30,
+                    "file_count": 2,
+                    "classification": "safe_to_review",
+                    "reason": "large folder",
+                    "risk": "low",
+                }
+            ],
+            "logs": [{"path": "/tmp/root", "event": "ok", "message": "done"}],
+        }
+
+
 class ApiTests(unittest.TestCase):
     def request(self, server, method: str, path: str) -> tuple[int, dict[str, object]]:
         connection = HTTPConnection(server.server_address[0], server.server_address[1], timeout=2)
@@ -178,6 +213,9 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(scan_payload["status"], "completed")
         self.assertEqual(status_status, 200)
         self.assertEqual(status_payload["status"], "completed")
+        self.assertIn("phase", status_payload)
+        self.assertIn("active_path", status_payload)
+        self.assertIn("pending_roots", status_payload)
         self.assertEqual(results_status, 200)
         self.assertEqual(len(results_payload["entries"]), 3)
         self.assertEqual(suggestions_status, 200)
@@ -364,7 +402,40 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(export_status, 404)
         self.assertEqual(export_payload, {"error": "no_scan_results"})
         self.assertEqual(status_status, 200)
-        self.assertEqual(status_payload, {"status": "idle"})
+        self.assertEqual(status_payload["status"], "idle")
+        self.assertEqual(status_payload["phase"], "idle")
+
+    def test_scan_progress_updates_status_during_scan_and_finishes_cleanly(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            scanner = ProgressScanner()
+            server = create_server(
+                "127.0.0.1",
+                0,
+                store=SnapshotStore(Path(temp_dir) / "state.json"),
+                scanner=scanner,
+                disk_path=Path(temp_dir),
+            )
+            scanner.server = server
+
+            snapshot = server.run_scan()
+            running_status = scanner.observed_status
+            final_status = server.scan_status()
+
+        self.assertEqual(snapshot["entries"][0]["path"], "/tmp/root/project")
+        self.assertEqual(running_status["status"], "running")
+        self.assertEqual(running_status["phase"], "directory")
+        self.assertEqual(running_status["active_root"], "/tmp/root")
+        self.assertEqual(running_status["active_path"], "/tmp/root/project")
+        self.assertEqual(running_status["pending_roots"], ["/tmp/root"])
+        self.assertEqual(running_status["entries_seen"], 4)
+        self.assertEqual(running_status["logs_seen"], 1)
+        self.assertEqual(final_status["status"], "completed")
+        self.assertEqual(final_status["phase"], "complete")
+        self.assertIsNone(final_status["active_path"])
+        self.assertEqual(final_status["pending_roots"], [])
+        self.assertEqual(final_status["entries_seen"], 1)
+        self.assertEqual(final_status["logs_seen"], 1)
+        self.assertIsNotNone(final_status["finished_at"])
 
     def test_malformed_snapshot_size_does_not_crash_suggestions_or_export(self) -> None:
         with TemporaryDirectory() as temp_dir:

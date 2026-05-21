@@ -41,6 +41,25 @@ class SkeletonTests(unittest.TestCase):
         self.assertEqual(roots[0], Path.home())
         self.assertEqual(roots[1], Path("/tmp"))
 
+    def test_scanner_emits_progress_for_roots_and_paths(self) -> None:
+        events = []
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            folder = root / "folder"
+            folder.mkdir()
+            (folder / "file.txt").write_text("data")
+
+            result = scan(ScanOptions(roots=(root,)), progress=events.append)
+
+        phases = [event["phase"] for event in events]
+        self.assertIn("starting", phases)
+        self.assertIn("root", phases)
+        self.assertIn("directory", phases)
+        self.assertIn("file", phases)
+        self.assertIn("complete", phases)
+        self.assertTrue(any(event.get("active_path") == str(folder) for event in events))
+        self.assertEqual(events[-1]["entries_seen"], len(result.entries))
+
     def test_unknown_classifier_defaults_to_do_not_touch(self) -> None:
         classification = classify_path("example.txt")
 

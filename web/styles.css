@@ -280,37 +280,35 @@ h1 span {
   font-size: 12px;
 }
 
-.segments {
+.tui-meter {
   display: grid;
-  grid-template-columns: repeat(24, 1fr);
+  grid-template-columns: auto minmax(0, 1fr) auto;
   gap: 2px;
-  height: 18px;
+  padding: 4px 6px;
+  overflow: hidden;
+  border: 1px solid var(--line-dim);
+  background: #050d14;
+  color: var(--cyan);
+  font-size: 15px;
+  line-height: 1.15;
+  white-space: nowrap;
 }
 
-.segment {
-  min-width: 6px;
-  border: 1px solid #132939;
-  background: #071018;
+.tui-meter span:nth-child(2) {
+  overflow: hidden;
+  text-overflow: clip;
 }
 
-.segment.on.cyan {
-  background: linear-gradient(180deg, hsl(190 92% 68%), hsl(190 72% 32%));
-  border-color: hsl(190 82% 52%);
+.tui-meter.green {
+  color: var(--green);
 }
 
-.segment.on.green {
-  background: linear-gradient(180deg, hsl(134 70% 68%), hsl(134 60% 32%));
-  border-color: hsl(134 62% 52%);
+.tui-meter.amber {
+  color: var(--amber);
 }
 
-.segment.on.amber {
-  background: linear-gradient(180deg, hsl(38 82% 64%), hsl(38 70% 32%));
-  border-color: hsl(38 72% 52%);
-}
-
-.segment.on.red {
-  background: linear-gradient(180deg, hsl(4 90% 70%), hsl(4 70% 36%));
-  border-color: hsl(4 82% 58%);
+.tui-meter.red {
+  color: var(--red);
 }
 
 .detail {
@@ -346,19 +344,140 @@ h1 span {
   text-align: center;
 }
 
-.mini-bars {
+.tui-bars {
   display: grid;
-  grid-template-columns: repeat(10, 1fr);
-  gap: 4px;
+  grid-template-columns: repeat(10, minmax(12px, 1fr));
+  gap: 6px;
   align-items: end;
   min-height: 130px;
-  padding-top: 10px;
+  padding: 10px 0 0;
 }
 
-.mini-bar {
-  min-height: 8px;
+.tui-vbar {
+  display: grid;
+  grid-template-rows: repeat(8, 1fr);
+  justify-items: center;
+  min-height: 112px;
   border: 1px solid var(--line-dim);
-  background: linear-gradient(180deg, hsl(190 92% 68%), hsl(190 72% 32%));
+  background: #050d14;
+  color: #24465b;
+  line-height: 1;
+}
+
+.tui-vbar .on {
+  color: var(--cyan);
+}
+
+.scan-debug {
+  min-height: 260px;
+}
+
+.debug-toolbar,
+.debug-line,
+.debug-root,
+.debug-events div {
+  display: grid;
+  gap: 8px;
+  align-items: center;
+}
+
+.debug-toolbar {
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.debug-toolbar span,
+.debug-label {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.debug-line {
+  grid-template-columns: 64px 56px minmax(0, 1fr);
+  padding: 8px;
+  border: 1px solid var(--line-dim);
+  background: #050d14;
+}
+
+.scan-marker {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.scan-marker.running {
+  color: var(--cyan);
+}
+
+.debug-path {
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.debug-grid div {
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid var(--line-dim);
+  background: #07131d;
+}
+
+.debug-grid strong {
+  overflow: hidden;
+  color: var(--cyan);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-roots,
+.debug-events {
+  display: grid;
+  gap: 6px;
+}
+
+.debug-root {
+  grid-template-columns: 56px minmax(0, 1fr) auto;
+  min-height: 32px;
+  padding: 6px 8px;
+  border: 1px solid var(--line-dim);
+  background: #07131d;
+  font-size: 12px;
+}
+
+.debug-events div {
+  grid-template-columns: 150px minmax(0, 1fr);
+  min-height: 32px;
+  padding: 6px 8px;
+  border: 1px solid var(--line-dim);
+  background: #07131d;
+  font-size: 12px;
+}
+
+.debug-root span:nth-child(2),
+.debug-events span:nth-child(2) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-root.done {
+  color: var(--green);
+}
+
+.debug-root.scanning {
+  border-color: var(--cyan);
+  color: var(--cyan);
+}
+
+.debug-root.queued {
+  color: var(--muted);
 }
 
 @media (max-width: 760px) {
@@ -382,6 +501,13 @@ h1 span {
   }
 
   .row {
+    grid-template-columns: 1fr;
+  }
+
+  .debug-grid,
+  .debug-line,
+  .debug-root,
+  .debug-events div {
     grid-template-columns: 1fr;
   }
 }
