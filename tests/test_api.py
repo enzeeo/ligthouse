@@ -513,9 +513,11 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(unknown_payload, {"error": "not_found"})
         self.assertNotIn("do-not-return-this", json.dumps(unknown_payload))
 
-    def test_create_server_rejects_non_loopback_host(self) -> None:
-        with self.assertRaises(ValueError):
-            create_server("0.0.0.0", 0)
+    def test_create_server_rejects_hosts_other_than_127_0_0_1(self) -> None:
+        for host in ("0.0.0.0", "localhost", "::1"):
+            with self.subTest(host=host):
+                with self.assertRaises(ValueError):
+                    create_server(host, 0)
 
 
 if __name__ == "__main__":

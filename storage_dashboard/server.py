@@ -14,7 +14,7 @@ from storage_dashboard import scanner as filesystem_scanner
 from storage_dashboard.store import SnapshotStore
 
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+ALLOWED_HOST = "127.0.0.1"
 SUGGESTION_CLASSES = {"safe_to_review": 0, "caution": 1}
 
 
@@ -209,10 +209,10 @@ def create_server(
     scanner: object | None = None,
     disk_path: Path | None = None,
 ) -> DashboardServer:
-    """Create a loopback-only dashboard server."""
+    """Create a dashboard server bound to the approved IPv4 loopback host."""
 
-    if host not in LOOPBACK_HOSTS:
-        raise ValueError("Storage dashboard server only supports loopback hosts.")
+    if host != ALLOWED_HOST:
+        raise ValueError("Storage dashboard server only supports 127.0.0.1.")
 
     return DashboardServer(
         (host, port),

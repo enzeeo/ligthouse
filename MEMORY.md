@@ -28,3 +28,8 @@
 - Decided: Keep the dashboard sparse with 2-3 panels per tab, row lists that scroll after a few rows, and single-hue light-to-dark meter gradients.
 - Why: Preserves the safety-first local review model while matching the requested btop/TUI visual direction.
 - Rejected: Purple palette in v1, destructive UI/API controls, broad browser automation side effects, and a Finder reveal endpoint without a follow-up approval.
+
+### 2026-05-21 - Exact Loopback Binding
+- Decided: `create_server()` accepts only the exact host `127.0.0.1`; it rejects `localhost`, `::1`, `0.0.0.0`, and other hosts.
+- Why: The implementation plan required binding to `127.0.0.1` only, not broader loopback aliases.
+- Rejected: Treating `localhost` or IPv6 loopback as equivalent in v1.
