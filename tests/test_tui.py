@@ -49,6 +49,7 @@ class TuiTests(unittest.TestCase):
             disk=SNAPSHOT["disk"],
             status={"status": "completed", "phase": "complete"},
             history=(SNAPSHOT, {**SNAPSHOT, "id": "snap-2", "timestamp": "2026-05-21T12:10:00+00:00"}),
+            scan_roots=("/tmp/root",),
         )
 
     def test_renderer_golden_overview(self) -> None:
@@ -93,6 +94,59 @@ class TuiTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 5)
         self.assertTrue(any("r refresh" in row for row in rows))
+        self.assertTrue(all(len(row) == 24 for row in rows))
+
+    def test_first_scan_idle_minimal_screen(self) -> None:
+        rows = tui.render(tui.TuiState(status={"status": "idle", "phase": "idle"}), 40, 8)
+
+        self.assertEqual(len(rows), 8)
+        self.assertTrue(any(row.strip() == "LIGHTHOUSE" for row in rows))
+        self.assertTrue(any("Press r to scan" in row for row in rows))
+        self.assertFalse(any("Overview" in row for row in rows))
+
+    def test_first_scan_running_shows_active_path(self) -> None:
+        state = tui.TuiState(
+            status={
+                "status": "running",
+                "phase": "scan",
+                "active_root": "/tmp/root",
+                "active_path": "/tmp/root/project",
+                "completed_roots": [],
+                "pending_roots": ["/tmp/root"],
+            },
+            scan_roots=("/tmp/root",),
+        )
+
+        rows = tui.render(state, 72, 10)
+
+        self.assertTrue(any("Checking /tmp/root/project" in row for row in rows))
+
+    def test_debugger_lists_configured_top_level_roots(self) -> None:
+        state = tui.TuiState(
+            active_tab="overview",
+            snapshot=SNAPSHOT,
+            disk=SNAPSHOT["disk"],
+            status={
+                "status": "running",
+                "phase": "scan",
+                "active_root": "/Users/me/Desktop",
+                "active_path": "/Users/me/Desktop/file.txt",
+                "completed_roots": ["/Users/me/Downloads"],
+                "pending_roots": ["/Users/me/Desktop", "/Users/me/Documents"],
+            },
+            scan_roots=("/Users/me/Downloads", "/Users/me/Desktop", "/Users/me/Documents"),
+        )
+
+        rows = tui.render(state, 100, 12)
+
+        self.assertTrue(any("[done] /Users/me/Downloads" in row for row in rows))
+        self.assertTrue(any("[scan] /Users/me/Desktop" in row for row in rows))
+        self.assertTrue(any("[wait] /Users/me/Documents" in row for row in rows))
+
+    def test_merge_runtime_tracks_runtime_roots(self) -> None:
+        state = tui.merge_runtime(tui.TuiState(), FakeRuntime())
+
+        self.assertEqual(state.scan_roots, ("/tmp/root", "/tmp/other"))
 
     def test_input_mapping_keys(self) -> None:
         curses = FakeCurses()
@@ -104,6 +158,7 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(tui.map_key(curses.KEY_UP, curses).name, "up")
         self.assertEqual(tui.map_key(curses.KEY_NPAGE, curses).name, "page_down")
         self.assertEqual(tui.map_key(curses.KEY_PPAGE, curses).name, "page_up")
+        self.assertEqual(tui.map_key(curses.KEY_MOUSE, curses).name, "mouse")
 
     def test_mouse_mapping_fallback(self) -> None:
         self.assertEqual(tui.map_mouse((0, 16, 1, 0, 0), 60), tui.InputAction("mouse_tab", "review"))
@@ -207,6 +262,7 @@ class FakeScreen:
 
 class FakeRuntime:
     store = None
+    roots = ("/tmp/root", "/tmp/other")
 
     def latest_compatible_snapshot(self):
         return SNAPSHOT

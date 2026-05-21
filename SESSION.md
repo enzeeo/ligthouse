@@ -16,6 +16,7 @@
 - Added `lighthouse` console script dispatch: default TUI, `lighthouse web` browser dashboard.
 - Added shared `ScanRuntime` with freshness checks, compatible snapshot metadata, and advisory scan lock.
 - Added stdlib curses TUI renderer/input loop and tests.
+- Refreshed the curses TUI with btop-style bordered panels, safe color setup, responsive overview/debug layouts, first-scan idle/running screens, and a root-level scan debugger.
 
 ## In Progress
 - No git staging or commit has been done in this continuation.
@@ -27,6 +28,8 @@
 - HTTP smoke passed for `/`, `/api/disk`, and `/api/scan/status` on `127.0.0.1:8765`.
 - `python3 -B -m unittest` passed 66 tests after the TUI/runtime work.
 - `python3 -m py_compile app.py storage_dashboard/*.py tests/*.py` passed.
+- `python3 -m unittest tests.test_tui` passed 16 tests.
+- `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest` passed 70 tests with approved localhost socket access; emitted one ResourceWarning for an unclosed localhost socket from the existing test suite.
 
 ## Decisions Made
 - V1 remains read-only: no delete, move, rename, chmod, trash, external API, CDN, npm, or build step.
@@ -34,6 +37,7 @@
 - `Reveal in Finder` stays disabled for v1 by owner choice; `Copy Path` is the safe substitute.
 - No real scan over default home folders should be run in this finish pass.
 - TUI auto-refresh uses background scans only when no fresh compatible snapshot exists.
+- TUI scan progress uses configured runtime roots and status markers: `[done]`, `[scan]`, `[wait]`, and `[idle]`.
 
 ## Open Questions
 - Browser visual smoke remains tooling-blocked by the local `gstack browse` helper from the prior session.

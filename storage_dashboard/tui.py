@@ -22,6 +22,15 @@ TAB_LABELS = {
     "log": "Log",
 }
 
+COLOR_PAIRS = {
+    "title": 1,
+    "accent": 2,
+    "ok": 3,
+    "warn": 4,
+    "muted": 5,
+    "border": 6,
+}
+
 
 @dataclass(frozen=True)
 class TuiState:
@@ -34,6 +43,7 @@ class TuiState:
     status: dict[str, object] | None = None
     disk: dict[str, object] | None = None
     history: tuple[dict[str, object], ...] = ()
+    scan_roots: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -74,6 +84,7 @@ class CursesTerminal:
         self.screen.keypad(True)
         self.screen.nodelay(True)
         self.curses.curs_set(0)
+        setup_colors(self.curses)
         try:
             self.curses.mousemask(self.curses.ALL_MOUSE_EVENTS)
         except Exception:
@@ -104,7 +115,7 @@ def _loop(screen, curses, runtime: ScanRuntime) -> None:
     state = load_state(runtime)
     while True:
         height, width = screen.getmaxyx()
-        draw(screen, render(state, width, height))
+        draw(screen, render(state, width, height), curses)
         key = screen.getch()
         if key != -1:
             action = map_key(key, curses)
@@ -128,12 +139,14 @@ def load_state(runtime: ScanRuntime) -> TuiState:
 def merge_runtime(state: TuiState, runtime: ScanRuntime) -> TuiState:
     snapshot = runtime.latest_compatible_snapshot()
     history = tuple(item for item in runtime.store.load().get("snapshots", []) if isinstance(item, dict))
+    scan_roots = tuple(str(root) for root in getattr(runtime, "roots", ()))
     return replace(
         state,
         snapshot=snapshot,
         status=runtime.scan_status(),
         disk=(snapshot.get("disk") if isinstance(snapshot, dict) else None) or runtime.disk_summary(),
         history=history[-10:],
+        scan_roots=scan_roots,
     )
 
 
@@ -204,15 +217,43 @@ def map_mouse(mouse_event: tuple[int, int, int, int, int], width: int) -> InputA
 def render(state: TuiState, width: int, height: int) -> list[str]:
     width = max(20, width)
     height = max(5, height)
-    rows = [fit("LIGHTHOUSE  " + status_text(state), width)]
-    rows.append(render_tabs(state.active_tab, width))
-    rows.append(fit(state.notice or snapshot_text(state), width))
+    if not isinstance(state.snapshot, dict):
+        rows = render_first_scan(state, width, height)
+        return pad_rows(rows, width, height)
+
+    rows = [
+        fit("LIGHTHOUSE  " + status_text(state), width),
+        render_tabs(state.active_tab, width),
+        fit(state.notice or snapshot_text(state), width),
+    ]
 
     if height <= 8:
         rows.extend(render_tiny(state, width))
+    elif state.active_tab == "overview":
+        rows.extend(render_overview_dashboard(state, width, height - len(rows)))
     else:
         rows.extend(render_active_tab(state, width, height - len(rows)))
-    return [fit(row, width) for row in rows[:height]]
+    return pad_rows(rows, width, height)
+
+
+def render_first_scan(state: TuiState, width: int, height: int) -> list[str]:
+    status = state.status or {}
+    if status.get("status") == "running":
+        rows = [
+            center("LIGHTHOUSE", width),
+            center(status_text(state), width),
+            fit(running_line(state), width),
+        ]
+        if height > 6:
+            rows.extend(panel("Scan Debugger", debugger_rows(state), width, max(3, height - len(rows))))
+        return rows
+
+    top_pad = max(0, (height - 4) // 2)
+    return [" " * width for _ in range(top_pad)] + [
+        center("LIGHTHOUSE", width),
+        center("Press r to scan", width),
+        center("q quit", width),
+    ]
 
 
 def render_tabs(active_tab: str, width: int) -> str:
@@ -226,10 +267,31 @@ def render_tabs(active_tab: str, width: int) -> str:
 def render_tiny(state: TuiState, width: int) -> list[str]:
     entries = entries_from_state(state)
     logs = logs_from_state(state)
-    return [
+    rows = [
         fit(f"{TAB_LABELS[state.active_tab]} | rows {len(entries)} | logs {len(logs)}", width),
         fit("r refresh  q quit", width),
     ]
+    if (state.status or {}).get("status") == "running":
+        rows.insert(1, fit(running_line(state), width))
+    return rows
+
+
+def render_overview_dashboard(state: TuiState, width: int, available: int) -> list[str]:
+    overview = overview_rows(state, width)
+    debugger = debugger_rows(state)
+    if available <= 6:
+        return render_tiny(state, width)[:available]
+    if width >= 96 and available >= 8:
+        left_width = max(40, width // 2)
+        right_width = width - left_width - 1
+        left = panel("Overview", overview, left_width, available)
+        right = panel("Scan Debugger", debugger, right_width, available)
+        return [fit(f"{left_row} {right_row}", width) for left_row, right_row in zip(left, right)]
+    rows = panel("Overview", overview, width, min(available, max(6, available // 2)))
+    remaining = available - len(rows)
+    if remaining > 0:
+        rows.extend(panel("Scan Debugger", debugger, width, remaining))
+    return rows
 
 
 def render_active_tab(state: TuiState, width: int, available: int) -> list[str]:
@@ -258,13 +320,61 @@ def overview_rows(state: TuiState, width: int) -> list[str]:
     suggestions = suggestions_from_snapshot(state.snapshot)
     percent = number(disk.get("percent"))
     rows = [
-        f"Disk  {format_bytes(disk.get('used'))} / {format_bytes(disk.get('total'))}  {percent:.1f}%",
+        f"Disk      {format_bytes(disk.get('used'))} / {format_bytes(disk.get('total'))}  {percent:.1f}%",
         meter(percent, state.use_ascii),
         f"Snapshot rows {len(entries)}  review {len(suggestions)}  log {len(logs)}",
     ]
     for root in root_summaries(state)[: max(1, min(5, width // 20))]:
         rows.append(f"{format_bytes(root['size'])}  {root['path']}")
     return rows
+
+
+def debugger_rows(state: TuiState) -> list[str]:
+    roots = debugger_roots(state)
+    if not roots:
+        return ["No scan roots configured."]
+
+    completed = set(string_list((state.status or {}).get("completed_roots")))
+    pending = set(string_list((state.status or {}).get("pending_roots")))
+    active = str((state.status or {}).get("active_root") or "")
+    rows = [running_line(state)]
+    for root in roots:
+        if root in completed:
+            marker = "done"
+        elif root == active:
+            marker = "scan"
+        elif root in pending:
+            marker = "wait"
+        else:
+            marker = "idle"
+        rows.append(f"[{marker}] {root}")
+    return rows
+
+
+def debugger_roots(state: TuiState) -> list[str]:
+    if state.scan_roots:
+        return list(state.scan_roots)
+    if isinstance(state.snapshot, dict):
+        roots = state.snapshot.get("roots", [])
+        if isinstance(roots, list):
+            return [str(root) for root in roots]
+    status = state.status or {}
+    roots = string_list(status.get("completed_roots")) + string_list(status.get("pending_roots"))
+    active = status.get("active_root")
+    if active is not None:
+        roots.append(str(active))
+    return dedupe(roots)
+
+
+def running_line(state: TuiState) -> str:
+    status = state.status or {}
+    active_path = status.get("active_path")
+    active_root = status.get("active_root")
+    pending = string_list(status.get("pending_roots"))
+    target = active_path or active_root or (pending[0] if pending else None)
+    if status.get("status") == "running" and target:
+        return f"Checking {target}"
+    return "Scan idle"
 
 
 def growth_rows(state: TuiState) -> list[str]:
@@ -298,14 +408,57 @@ def mark_selected(rows: list[str], selected: int, width: int) -> list[str]:
     return marked
 
 
-def draw(screen, rows: list[str]) -> None:
+def draw(screen, rows: list[str], curses_module=None) -> None:
     screen.erase()
     for y, row in enumerate(rows):
         try:
-            screen.addstr(y, 0, row)
+            attr = row_attr(row, curses_module)
+            if attr:
+                screen.addstr(y, 0, row, attr)
+            else:
+                screen.addstr(y, 0, row)
         except Exception:
-            pass
+            try:
+                screen.addstr(y, 0, row)
+            except Exception:
+                pass
     screen.refresh()
+
+
+def setup_colors(curses_module) -> None:
+    try:
+        if not curses_module.has_colors():
+            return
+        curses_module.start_color()
+        if hasattr(curses_module, "use_default_colors"):
+            curses_module.use_default_colors()
+        curses_module.init_pair(COLOR_PAIRS["title"], curses_module.COLOR_CYAN, -1)
+        curses_module.init_pair(COLOR_PAIRS["accent"], curses_module.COLOR_BLUE, -1)
+        curses_module.init_pair(COLOR_PAIRS["ok"], curses_module.COLOR_GREEN, -1)
+        curses_module.init_pair(COLOR_PAIRS["warn"], curses_module.COLOR_YELLOW, -1)
+        curses_module.init_pair(COLOR_PAIRS["muted"], curses_module.COLOR_WHITE, -1)
+        curses_module.init_pair(COLOR_PAIRS["border"], curses_module.COLOR_MAGENTA, -1)
+    except Exception:
+        return
+
+
+def row_attr(row: str, curses_module) -> int:
+    if curses_module is None:
+        return 0
+    try:
+        if row.startswith("LIGHTHOUSE") or row.strip() == "LIGHTHOUSE":
+            return curses_module.color_pair(COLOR_PAIRS["title"]) | getattr(curses_module, "A_BOLD", 0)
+        if row.startswith("+") or row.startswith("|"):
+            return curses_module.color_pair(COLOR_PAIRS["border"])
+        if "[done]" in row:
+            return curses_module.color_pair(COLOR_PAIRS["ok"])
+        if "[scan]" in row or "Checking " in row:
+            return curses_module.color_pair(COLOR_PAIRS["title"])
+        if "[wait]" in row:
+            return curses_module.color_pair(COLOR_PAIRS["muted"])
+    except Exception:
+        return 0
+    return 0
 
 
 def status_text(state: TuiState) -> str:
@@ -411,3 +564,41 @@ def fit(text: str, width: int) -> str:
     if len(text) <= width:
         return text.ljust(width)
     return text[: max(0, width - 1)] + "~"
+
+
+def pad_rows(rows: list[str], width: int, height: int) -> list[str]:
+    fitted = [fit(row, width) for row in rows[:height]]
+    fitted.extend(" " * width for _ in range(height - len(fitted)))
+    return fitted
+
+
+def center(text: str, width: int) -> str:
+    return fit(text.center(width), width)
+
+
+def panel(title: str, rows: list[str], width: int, height: int) -> list[str]:
+    if height <= 0:
+        return []
+    if width < 8 or height < 3:
+        return [fit(row, width) for row in rows[:height]]
+    title_text = f" {title} "
+    top = "+" + title_text[: max(0, width - 2)].ljust(width - 2, "-") + "+"
+    bottom = "+" + "-" * (width - 2) + "+"
+    body_height = max(0, height - 2)
+    body = [f"|{fit(row, width - 2)}|" for row in rows[:body_height]]
+    body.extend("|" + " " * (width - 2) + "|" for _ in range(body_height - len(body)))
+    return [top] + body + ([bottom] if height > 1 else [])
+
+
+def string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]
+
+
+def dedupe(values: list[str]) -> list[str]:
+    result = []
+    for value in values:
+        if value not in result:
+            result.append(value)
+    return result

@@ -40,3 +40,9 @@
 - Decided: Keep the TUI stdlib-only, read-only, keyboard-first, and backed by compatible cached snapshots plus background refresh when stale.
 - Why: Gives the requested btop-style terminal app without adding dependencies or duplicating scanner/store behavior.
 - Rejected: Constant scanning, destructive file actions, Windows TUI support in v1, and a separate growth data store.
+
+### 2026-05-21 - Btop-Style TUI Scan Debugger
+- Decided: Evolve the curses TUI toward richer btop-inspired panels, color accents, responsive overview/debug layouts, and first-scan states while keeping `LIGHTHOUSE` as the title.
+- Decided: Track configured runtime roots in `TuiState` and render a scan debugger using `completed_roots`, `active_root`, `active_path`, and `pending_roots`.
+- Decided: Keep tests focused on text markers and bounds instead of terminal color escape behavior.
+- Why: The live UI needs clearer scan progress without adding dependencies or changing scan/runtime public APIs.
