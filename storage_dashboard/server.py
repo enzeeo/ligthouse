@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import shutil
+import sys
 import threading
 from urllib.parse import urlparse
 
@@ -325,4 +327,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the local storage dashboard.")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
-    run(port=args.port)
+    try:
+        run(port=args.port)
+    except OSError as error:
+        if error.errno != errno.EADDRINUSE:
+            raise
+        next_port = args.port + 1
+        print(
+            f"Port {args.port} is already in use. "
+            f"Stop the process using it or run: python3 app.py --port {next_port}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None

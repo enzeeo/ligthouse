@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import io
 import json
 import threading
@@ -6,8 +7,9 @@ import unittest
 from http.client import HTTPConnection
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
-from storage_dashboard.server import DashboardRequestHandler, create_server
+from storage_dashboard.server import DashboardRequestHandler, create_server, main
 from storage_dashboard.store import SnapshotStore
 
 
@@ -78,6 +80,21 @@ class ApiTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
         return thread
+
+    def test_main_reports_port_conflict_without_traceback(self) -> None:
+        error = OSError(errno.EADDRINUSE, "Address already in use")
+
+        with (
+            patch("sys.argv", ["app.py"]),
+            patch("storage_dashboard.server.run", side_effect=error),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            with self.assertRaises(SystemExit) as exit_error:
+                main()
+
+        self.assertEqual(exit_error.exception.code, 1)
+        self.assertIn("Port 8765 is already in use.", stderr.getvalue())
+        self.assertIn("python3 app.py --port 8766", stderr.getvalue())
 
     def test_store_prunes_snapshots_to_limit(self) -> None:
         with TemporaryDirectory() as temp_dir:
