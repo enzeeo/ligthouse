@@ -56,15 +56,31 @@ class TuiTests(unittest.TestCase):
     def test_renderer_golden_overview(self) -> None:
         rows = tui.render(self.state("overview"), 72, 12)
 
-        self.assertIn("LIGHTHOUSE  completed:complete", rows[0])
+        self.assertIn("LIGHTHOUSE", rows[0])
         self.assertIn("[1 Overview]", rows[1])
-        self.assertTrue(any("Snapshot rows 3" in row for row in rows))
+        self.assertTrue(any("Disk" in row for row in rows))
+
+    def test_wide_overview_uses_btop_style_dashboard_panels(self) -> None:
+        rows = tui.render(self.state("overview"), 120, 30)
+
+        self.assertTrue(any("Disk" in row for row in rows))
+        self.assertTrue(any("Review Queue" in row for row in rows))
+        self.assertTrue(any("Scan Debugger" in row for row in rows))
+        self.assertTrue(any("Growth History" in row for row in rows))
+        self.assertTrue(any("Log Stream" in row for row in rows))
 
     def test_renderer_golden_review(self) -> None:
         rows = tui.render(self.state("review"), 72, 12)
 
         self.assertIn("[2 Review]", rows[1])
-        self.assertTrue(any("safe_to_review" in row and "file.bin" in row for row in rows))
+        self.assertTrue(any("SAFE" in row and "file.bin" in row for row in rows))
+
+    def test_selected_review_row_remains_visible_after_scroll(self) -> None:
+        state = replace(self.state("review"), selected_index=1, scroll=1)
+
+        rows = tui.render(state, 110, 14)
+
+        self.assertTrue(any("▶" in row and "WARN" in row and "archive.zip" in row for row in rows))
 
     def test_renderer_golden_files(self) -> None:
         rows = tui.render(self.state("files"), 72, 12)
@@ -140,9 +156,9 @@ class TuiTests(unittest.TestCase):
 
         rows = tui.render(state, 100, 12)
 
-        self.assertTrue(any("[done] /Users/me/Downloads" in row for row in rows))
-        self.assertTrue(any("[scan] /Users/me/Desktop" in row for row in rows))
-        self.assertTrue(any("[wait] /Users/me/Documents" in row for row in rows))
+        self.assertTrue(any("DONE /Users/me/Downloads" in row for row in rows))
+        self.assertTrue(any("SCAN /Users/me/Desktop" in row for row in rows))
+        self.assertTrue(any("WAIT /Users/me/Documents" in row for row in rows))
 
     def test_merge_runtime_tracks_runtime_roots(self) -> None:
         state = tui.merge_runtime(tui.TuiState(), FakeRuntime())
@@ -163,7 +179,7 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(tui.map_key(curses.KEY_UP, curses).name, "up")
         self.assertEqual(tui.map_key(curses.KEY_NPAGE, curses).name, "page_down")
         self.assertEqual(tui.map_key(curses.KEY_PPAGE, curses).name, "page_up")
-        self.assertEqual(tui.map_key(curses.KEY_MOUSE, curses).name, "mouse")
+        self.assertEqual(tui.map_key(curses.KEY_MOUSE, curses).name, "noop")
 
     def test_tab_cycle_actions_wrap_and_reset_position(self) -> None:
         state = tui.TuiState(active_tab="overview", scroll=4, selected_index=4, snapshot=SNAPSHOT)
@@ -193,12 +209,20 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(state.active_tab, "review")
         self.assertIn("[2 Review]", rows[1])
 
-    def test_mouse_mapping_fallback(self) -> None:
-        self.assertEqual(tui.map_mouse((0, 16, 1, 0, 0), 60), tui.InputAction("mouse_tab", "review"))
-        self.assertEqual(tui.map_mouse((0, 2, 6, 0, 0), 60), tui.InputAction("mouse_row", 2))
-
     def test_ascii_bar_fallback(self) -> None:
         self.assertEqual(tui.bar(50, 100, ascii_only=True, cells=4), "##..")
+
+    def test_setup_colors_tolerates_limited_color_terminal(self) -> None:
+        tui.setup_colors(FakeLimitedColorCurses())
+
+    def test_draw_applies_palette_background_when_available(self) -> None:
+        curses = FakeColorCurses()
+        screen = FakeScreen()
+
+        tui.setup_colors(curses)
+        tui.draw(screen, ["LIGHTHOUSE"], curses)
+
+        self.assertTrue(screen.backgrounds)
 
     def test_terminal_cleanup_on_exception_and_sigint_handler_restore(self) -> None:
         curses = FakeCurses()
@@ -210,6 +234,7 @@ class TuiTests(unittest.TestCase):
         self.assertTrue(curses.nocbreak_called)
         self.assertTrue(curses.echo_called)
         self.assertTrue(curses.endwin_called)
+        self.assertFalse(curses.mousemask_called)
         self.assertEqual(signal.getsignal(signal.SIGINT), old_handler)
 
     def test_sigint_handler_raises_keyboard_interrupt(self) -> None:
@@ -241,6 +266,7 @@ class FakeCurses:
         self.nocbreak_called = False
         self.echo_called = False
         self.endwin_called = False
+        self.mousemask_called = False
 
     def initscr(self):
         return self.screen
@@ -255,7 +281,7 @@ class FakeCurses:
         pass
 
     def mousemask(self, _value):
-        pass
+        self.mousemask_called = True
 
     def nocbreak(self):
         self.nocbreak_called = True
@@ -267,10 +293,48 @@ class FakeCurses:
         self.endwin_called = True
 
 
+class FakeLimitedColorCurses(FakeCurses):
+    COLOR_BLACK = 0
+    COLOR_BLUE = 4
+    COLOR_CYAN = 6
+    COLOR_GREEN = 2
+    COLOR_MAGENTA = 5
+    COLOR_RED = 1
+    COLOR_WHITE = 7
+    COLOR_YELLOW = 3
+
+    def has_colors(self):
+        return True
+
+    def start_color(self):
+        pass
+
+    def use_default_colors(self):
+        pass
+
+    def init_pair(self, _pair, _fg, _bg):
+        raise RuntimeError("limited color table")
+
+
+class FakeColorCurses(FakeLimitedColorCurses):
+    A_BOLD = 1 << 8
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pairs = []
+
+    def init_pair(self, pair, fg, bg):
+        self.pairs.append((pair, fg, bg))
+
+    def color_pair(self, pair):
+        return pair << 16
+
+
 class FakeScreen:
     def __init__(self, keys=None) -> None:
         self.keys = list(keys or [])
         self.refreshed = False
+        self.backgrounds = []
 
     def keypad(self, _value):
         pass
@@ -284,7 +348,10 @@ class FakeScreen:
     def erase(self):
         pass
 
-    def addstr(self, _y, _x, _text):
+    def bkgd(self, *args):
+        self.backgrounds.append(args)
+
+    def addstr(self, _y, _x, _text, *_attrs):
         pass
 
     def refresh(self):

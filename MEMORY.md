@@ -8,7 +8,7 @@
 - Decided: Skip symlinks by default.
 - Decided: Persist exact local paths only in local user state.
 - Decided: Do not include delete behavior in v1.
-- Decided: Use a sparse, btop-style clickable UI with a reduced palette.
+- Decided: Use a sparse, btop-style keyboard-only UI with a reduced palette.
 - Why: The app is intended for local storage visibility with conservative filesystem safety and no external runtime dependencies.
 - Rejected: External package dependencies, npm tooling, CDNs, external fonts, destructive file actions, and broad filesystem traversal defaults.
 
@@ -46,3 +46,16 @@
 - Decided: Track configured runtime roots in `TuiState` and render a scan debugger using `completed_roots`, `active_root`, `active_path`, and `pending_roots`.
 - Decided: Keep tests focused on text markers and bounds instead of terminal color escape behavior.
 - Why: The live UI needs clearer scan progress without adding dependencies or changing scan/runtime public APIs.
+
+### 2026-05-21 - Keyboard-Only TUI Input
+- Decided: Disable curses mouse mode, remove mouse event routing, and keep tab/row navigation keyboard-only.
+- Decided: Treat terminal mouse events as no-ops when surfaced by a test double.
+- Why: Clicking in the terminal caused crashes/focus traps; keyboard controls are enough for v1 and safer across terminals.
+- Rejected: Clickable tabs, mouse row selection, mouse scroll handling, and curses cursor/mouse setup.
+
+### 2026-05-22 - Slate/Oxblood Btop-Style TUI
+- Decided: Redesign the curses TUI around the second mockup: dark slate panels, muted steel-blue borders, pale gray text, dusty-blue highlights, and oxblood/coral risk accents.
+- Decided: Keep `render(state, width, height) -> list[str]`, stdlib-only curses, read-only behavior, keyboard navigation, and existing CLI/API contracts unchanged.
+- Decided: Use best-effort curses background/color pairs with fallback for limited terminals; tests should assert text markers/layout behavior, not exact terminal RGB output.
+- Why: User wants the TUI to mimic btop’s dense panel style while matching the Lighthouse palette more closely.
+- Rejected: New TUI dependencies, destructive actions, web dashboard changes, and relying on exact truecolor support.

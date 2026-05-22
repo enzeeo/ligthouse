@@ -29,6 +29,27 @@ COLOR_PAIRS = {
     "warn": 4,
     "muted": 5,
     "border": 6,
+    "danger": 7,
+    "background": 8,
+    "panel": 9,
+}
+
+PALETTE = {
+    "background": "#253954",
+    "panel": "#354b6a",
+    "danger": "#882139",
+    "accent": "#7c9cb3",
+    "border": "#64849b",
+    "text": "#bfc5ca",
+}
+
+CUSTOM_COLORS = {
+    "background": 16,
+    "panel": 17,
+    "danger": 18,
+    "accent": 19,
+    "border": 20,
+    "text": 21,
 }
 
 
@@ -83,12 +104,7 @@ class CursesTerminal:
         self.curses.cbreak()
         self.screen.keypad(True)
         self.screen.nodelay(True)
-        self.curses.curs_set(0)
         setup_colors(self.curses)
-        try:
-            self.curses.mousemask(self.curses.ALL_MOUSE_EVENTS)
-        except Exception:
-            pass
         self._old_sigint = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, _raise_keyboard_interrupt)
         return self.screen
@@ -119,8 +135,6 @@ def _loop(screen, curses, runtime: ScanRuntime) -> None:
         key = screen.getch()
         if key != -1:
             action = map_key(key, curses)
-            if action.name == "mouse":
-                action = map_mouse(curses.getmouse(), width)
             if action.name == "quit":
                 return
             if action.name == "refresh":
@@ -169,15 +183,6 @@ def reduce_state(state: TuiState, action: InputAction, width: int = 80, height: 
         return replace(state, selected_index=max(0, state.selected_index - amount), scroll=max(0, state.scroll - amount))
     if action.name == "select":
         return replace(state, notice="Selected row.")
-    if action.name == "mouse_tab" and action.value in TAB_ORDER:
-        return replace(state, active_tab=str(action.value), scroll=0, selected_index=0)
-    if action.name == "mouse_row":
-        index = max(0, int(action.value or 0) + state.scroll)
-        return replace(state, selected_index=index)
-    if action.name == "mouse_scroll_down":
-        return reduce_state(state, InputAction("down"), width, height)
-    if action.name == "mouse_scroll_up":
-        return reduce_state(state, InputAction("up"), width, height)
     return state
 
 
@@ -205,23 +210,6 @@ def map_key(key: int, curses_module) -> InputAction:
         return InputAction("page_down")
     if key == curses_module.KEY_PPAGE:
         return InputAction("page_up")
-    if key == getattr(curses_module, "KEY_MOUSE", -999):
-        return InputAction("mouse")
-    return InputAction("noop")
-
-
-def map_mouse(mouse_event: tuple[int, int, int, int, int], width: int) -> InputAction:
-    _id, x, y, _z, button = mouse_event
-    if y == 1:
-        tab_width = max(8, width // len(TAB_ORDER))
-        index = min(len(TAB_ORDER) - 1, max(0, x // tab_width))
-        return InputAction("mouse_tab", TAB_ORDER[index])
-    if button & 0x80000:
-        return InputAction("mouse_scroll_down")
-    if button & 0x100000:
-        return InputAction("mouse_scroll_up")
-    if y >= 4:
-        return InputAction("mouse_row", y - 4)
     return InputAction("noop")
 
 
@@ -233,9 +221,9 @@ def render(state: TuiState, width: int, height: int) -> list[str]:
         return pad_rows(rows, width, height)
 
     rows = [
-        fit("LIGHTHOUSE  " + status_text(state), width),
+        chrome_bar(f" LIGHTHOUSE  {status_text(state).upper()}  {snapshot_text(state)} ", width, "top"),
         render_tabs(state.active_tab, width),
-        fit(state.notice or snapshot_text(state), width),
+        chrome_bar(f" {state.notice or 'read-only storage dashboard'}  R refresh  Q quit  1-6 tabs  TAB/H/L move ", width, "mid"),
     ]
 
     if height <= 8:
@@ -272,7 +260,7 @@ def render_tabs(active_tab: str, width: int) -> str:
     for index, tab in enumerate(TAB_ORDER, start=1):
         label = f"{index} {TAB_LABELS[tab]}"
         pieces.append(f"[{label}]" if tab == active_tab else f" {label} ")
-    return fit(" ".join(pieces), width)
+    return chrome_bar(" " + " ".join(pieces) + " ", width, "mid")
 
 
 def render_tiny(state: TuiState, width: int) -> list[str]:
@@ -288,40 +276,142 @@ def render_tiny(state: TuiState, width: int) -> list[str]:
 
 
 def render_overview_dashboard(state: TuiState, width: int, available: int) -> list[str]:
-    overview = overview_rows(state, width)
-    debugger = debugger_rows(state)
     if available <= 6:
         return render_tiny(state, width)[:available]
+    if width >= 108 and available >= 15:
+        top_height = max(5, min(9, available // 3))
+        middle_height = max(5, min(9, (available - top_height) // 2))
+        bottom_height = max(3, available - top_height - middle_height)
+        left_width, right_width = split_width(width, 0.48)
+        rows = join_columns(
+            (
+                panel("Disk", disk_rows(state, left_width), left_width, top_height),
+                panel("Scan Debugger", debugger_rows(state), right_width, top_height),
+            ),
+            width,
+        )
+        rows.extend(
+            join_columns(
+                (
+                    panel("Review Queue", review_queue_rows(state), left_width, middle_height),
+                    panel("Folder Meters", folder_meter_rows(state, right_width), right_width, middle_height),
+                ),
+                width,
+            )
+        )
+        rows.extend(
+            join_columns(
+                (
+                    panel("Growth History", growth_rows(state), left_width, bottom_height),
+                    panel("Log Stream", log_stream_rows(state), right_width, bottom_height),
+                ),
+                width,
+            )
+        )
+        return rows[:available]
+
     if width >= 96 and available >= 8:
-        left_width = max(40, width // 2)
-        right_width = width - left_width - 1
-        left = panel("Overview", overview, left_width, available)
-        right = panel("Scan Debugger", debugger, right_width, available)
-        return [fit(f"{left_row} {right_row}", width) for left_row, right_row in zip(left, right)]
-    rows = panel("Overview", overview, width, min(available, max(6, available // 2)))
+        left_width, right_width = split_width(width, 0.48)
+        return join_columns(
+            (
+                panel("Disk", disk_rows(state, left_width), left_width, available),
+                panel("Scan Debugger", debugger_rows(state), right_width, available),
+            ),
+            width,
+        )
+
+    disk_height = min(available, max(5, available // 2))
+    rows = panel("Disk", disk_rows(state, width), width, disk_height)
     remaining = available - len(rows)
     if remaining > 0:
-        rows.extend(panel("Scan Debugger", debugger, width, remaining))
-    return rows
+        rows.extend(panel("Scan Debugger", debugger_rows(state), width, remaining))
+    return rows[:available]
 
 
 def render_active_tab(state: TuiState, width: int, available: int) -> list[str]:
-    if state.active_tab == "overview":
-        rows = overview_rows(state, width)
-    elif state.active_tab == "review":
-        rows = table_rows(suggestions_from_snapshot(state.snapshot), ("classification", "size_bytes", "path"))
-    elif state.active_tab == "files":
-        files = sorted((entry for entry in entries_from_state(state) if entry.get("kind") == "file"), key=size_of, reverse=True)
-        rows = table_rows(files, ("size_bytes", "classification", "path"))
-    elif state.active_tab == "folders":
-        folders = sorted((entry for entry in entries_from_state(state) if entry.get("kind") == "folder"), key=size_of, reverse=True)
-        rows = table_rows(folders, ("size_bytes", "file_count", "path"))
-    elif state.active_tab == "growth":
-        rows = growth_rows(state)
+    title, rows, items = tab_content(state)
+    if items:
+        header, data_rows = rows[:1], rows[1:]
+        visible_count = max(1, available - 3)
+        visible = header + mark_selected(data_rows[state.scroll : state.scroll + visible_count], state.selected_index - state.scroll, width)
+        selected = items[max(0, min(state.selected_index, len(items) - 1))]
     else:
-        rows = table_rows(logs_from_state(state), ("event", "message", "path"))
-    visible = rows[state.scroll : state.scroll + max(1, available)]
-    return mark_selected(visible, state.selected_index - state.scroll, width)
+        visible = rows[state.scroll : state.scroll + max(1, available - 2)]
+        selected = None
+
+    if width >= 104 and available >= 8 and state.active_tab in ("review", "files", "folders"):
+        left_width, right_width = split_width(width, 0.66)
+        return join_columns(
+            (
+                panel(title, visible, left_width, available),
+                panel("Details", detail_rows(selected), right_width, available),
+            ),
+            width,
+        )
+    return panel(title, visible, width, available)
+
+
+def tab_content(state: TuiState) -> tuple[str, list[str], list[dict[str, object]]]:
+    if state.active_tab == "review":
+        items = suggestions_from_snapshot(state.snapshot)
+        return "Review Queue", table_rows(items, ("classification", "size_bytes", "path")), items
+    if state.active_tab == "files":
+        items = sorted((entry for entry in entries_from_state(state) if entry.get("kind") == "file"), key=size_of, reverse=True)
+        return "Files", table_rows(items, ("size_bytes", "classification", "path")), items
+    if state.active_tab == "folders":
+        items = sorted((entry for entry in entries_from_state(state) if entry.get("kind") == "folder"), key=size_of, reverse=True)
+        return "Folders", table_rows(items, ("size_bytes", "file_count", "path")), items
+    if state.active_tab == "growth":
+        return "Growth History", growth_rows(state), []
+    if state.active_tab == "log":
+        items = logs_from_state(state)
+        return "Log Stream", table_rows(items, ("event", "message", "path")), []
+    return "Overview", overview_rows(state, 80), []
+
+
+def disk_rows(state: TuiState, width: int) -> list[str]:
+    disk = state.disk or {}
+    entries = entries_from_state(state)
+    suggestions = suggestions_from_snapshot(state.snapshot)
+    logs = logs_from_state(state)
+    percent = number(disk.get("percent"))
+    return [
+        f"Used {format_bytes(disk.get('used'))} / {format_bytes(disk.get('total'))}  Free {format_bytes(disk.get('free'))}",
+        framed_meter("DISK", percent, width=max(12, min(30, width - 16)), ascii_only=state.use_ascii),
+        f"Rows {len(entries)}  Review {len(suggestions)}  Logs {len(logs)}",
+        f"Trend {sparkline([total_bytes(snapshot) for snapshot in state.history], max(8, width - 8), state.use_ascii)}",
+    ]
+
+
+def review_queue_rows(state: TuiState) -> list[str]:
+    suggestions = suggestions_from_snapshot(state.snapshot)
+    if not suggestions:
+        return ["No safe review candidates yet."]
+    rows = []
+    for item in suggestions[:6]:
+        rows.append(f"{risk_label(item)} {format_bytes(item.get('size_bytes')):>7} {item.get('path', '')}")
+    return rows
+
+
+def folder_meter_rows(state: TuiState, width: int) -> list[str]:
+    roots = root_summaries(state)
+    if not roots:
+        return ["No scan roots yet."]
+    max_size = max(1, *(int(root["size"]) for root in roots))
+    rows = []
+    for root in roots[:5]:
+        rows.append(f"{format_bytes(root['size']):>7} {bar(root['size'], max_size, state.use_ascii, max(4, min(18, width // 4)))} {root['path']}")
+    return rows
+
+
+def log_stream_rows(state: TuiState) -> list[str]:
+    logs = logs_from_state(state)
+    if not logs:
+        return ["No scanner events."]
+    rows = []
+    for item in logs[-6:]:
+        rows.append(f"{item.get('event', '')} {item.get('message', '')} {item.get('path', '')}")
+    return rows
 
 
 def overview_rows(state: TuiState, width: int) -> list[str]:
@@ -351,14 +441,14 @@ def debugger_rows(state: TuiState) -> list[str]:
     rows = [running_line(state)]
     for root in roots:
         if root in completed:
-            marker = "done"
+            marker = "DONE"
         elif root == active:
-            marker = "scan"
+            marker = "SCAN"
         elif root in pending:
-            marker = "wait"
+            marker = "WAIT"
         else:
-            marker = "idle"
-        rows.append(f"[{marker}] {root}")
+            marker = "IDLE"
+        rows.append(f"{marker} {root}")
     return rows
 
 
@@ -393,33 +483,80 @@ def growth_rows(state: TuiState) -> list[str]:
         return ["Not enough local snapshot history yet."]
     values = [(snapshot.get("timestamp", ""), total_bytes(snapshot)) for snapshot in state.history]
     max_value = max(1, *(value for _time, value in values))
-    return [f"{short_time(time_value)} {bar(value, max_value, state.use_ascii)} {format_bytes(value)}" for time_value, value in values]
+    trend = sparkline([value for _time, value in values], 12, state.use_ascii)
+    return [f"{short_time(time_value)} {bar(value, max_value, state.use_ascii)} {format_bytes(value)}  {trend}" for time_value, value in values]
 
 
 def table_rows(items: Sequence[dict[str, object]], fields: tuple[str, ...]) -> list[str]:
     if not items:
         return ["No rows."]
-    rows = []
+    rows = ["  ".join(field.upper() for field in fields)]
     for item in items:
         cells = []
         for field in fields:
-            value = item.get(field)
-            if field == "size_bytes":
-                value = format_bytes(value)
-            cells.append(str(value or ""))
+            cells.append(format_cell(item, field))
         rows.append("  ".join(cells))
     return rows
+
+
+def format_cell(item: dict[str, object], field: str) -> str:
+    value = item.get(field)
+    if field == "size_bytes":
+        return format_bytes(value)
+    if field == "classification":
+        return risk_label(item)
+    return str(value or "")
+
+
+def detail_rows(item: dict[str, object] | None) -> list[str]:
+    if not item:
+        return ["No row selected."]
+    rows = [
+        f"Status {risk_label(item)}",
+        f"Size   {format_bytes(item.get('size_bytes'))}",
+        f"Kind   {item.get('kind', '')}",
+    ]
+    if item.get("file_count") is not None:
+        rows.append(f"Files  {item.get('file_count')}")
+    if item.get("reason"):
+        rows.append(f"Reason {item.get('reason')}")
+    rows.extend(
+        [
+            f"Path   {item.get('path', '')}",
+            "Mode   read-only",
+        ]
+    )
+    return rows
+
+
+def risk_label(item: dict[str, object] | object) -> str:
+    if isinstance(item, dict):
+        value = str(item.get("classification") or item.get("risk") or "").lower()
+    else:
+        value = str(item or "").lower()
+    if value in ("safe_to_review", "safe", "low"):
+        return "SAFE"
+    if value in ("caution", "medium", "warn", "warning"):
+        return "WARN"
+    if value in ("do_not_touch", "high", "critical", "keep"):
+        return "KEEP"
+    return value.upper() if value else "ITEM"
 
 
 def mark_selected(rows: list[str], selected: int, width: int) -> list[str]:
     marked = []
     for index, row in enumerate(rows):
-        prefix = "> " if index == selected else "  "
+        prefix = "▶ " if index == selected else "  "
         marked.append(fit(prefix + row, width))
     return marked
 
 
 def draw(screen, rows: list[str], curses_module=None) -> None:
+    if curses_module is not None:
+        try:
+            screen.bkgd(" ", curses_module.color_pair(COLOR_PAIRS["background"]))
+        except Exception:
+            pass
     screen.erase()
     for y, row in enumerate(rows):
         try:
@@ -443,30 +580,75 @@ def setup_colors(curses_module) -> None:
         curses_module.start_color()
         if hasattr(curses_module, "use_default_colors"):
             curses_module.use_default_colors()
-        curses_module.init_pair(COLOR_PAIRS["title"], curses_module.COLOR_CYAN, -1)
-        curses_module.init_pair(COLOR_PAIRS["accent"], curses_module.COLOR_BLUE, -1)
-        curses_module.init_pair(COLOR_PAIRS["ok"], curses_module.COLOR_GREEN, -1)
-        curses_module.init_pair(COLOR_PAIRS["warn"], curses_module.COLOR_YELLOW, -1)
-        curses_module.init_pair(COLOR_PAIRS["muted"], curses_module.COLOR_WHITE, -1)
-        curses_module.init_pair(COLOR_PAIRS["border"], curses_module.COLOR_MAGENTA, -1)
+        colors = color_ids(curses_module)
+        curses_module.init_pair(COLOR_PAIRS["title"], colors["accent"], colors["background"])
+        curses_module.init_pair(COLOR_PAIRS["accent"], colors["text"], colors["panel"])
+        curses_module.init_pair(COLOR_PAIRS["ok"], getattr(curses_module, "COLOR_GREEN", colors["accent"]), colors["background"])
+        curses_module.init_pair(COLOR_PAIRS["warn"], getattr(curses_module, "COLOR_YELLOW", colors["accent"]), colors["background"])
+        curses_module.init_pair(COLOR_PAIRS["muted"], colors["border"], colors["background"])
+        curses_module.init_pair(COLOR_PAIRS["border"], colors["border"], colors["background"])
+        curses_module.init_pair(COLOR_PAIRS["danger"], colors["danger"], colors["background"])
+        curses_module.init_pair(COLOR_PAIRS["background"], colors["text"], colors["background"])
+        curses_module.init_pair(COLOR_PAIRS["panel"], colors["text"], colors["panel"])
     except Exception:
         return
+
+
+def color_ids(curses_module) -> dict[str, int]:
+    colors = {
+        "background": getattr(curses_module, "COLOR_BLUE", -1),
+        "panel": getattr(curses_module, "COLOR_BLUE", -1),
+        "danger": getattr(curses_module, "COLOR_RED", getattr(curses_module, "COLOR_MAGENTA", -1)),
+        "accent": getattr(curses_module, "COLOR_CYAN", getattr(curses_module, "COLOR_BLUE", -1)),
+        "border": getattr(curses_module, "COLOR_CYAN", getattr(curses_module, "COLOR_BLUE", -1)),
+        "text": getattr(curses_module, "COLOR_WHITE", -1),
+    }
+    try:
+        can_change = bool(curses_module.can_change_color())
+        color_count = int(getattr(curses_module, "COLORS", 0))
+    except Exception:
+        return colors
+    if not can_change or color_count <= max(CUSTOM_COLORS.values()):
+        return colors
+    try:
+        for name, index in CUSTOM_COLORS.items():
+            curses_module.init_color(index, *rgb_1000(PALETTE[name]))
+            colors[name] = index
+    except Exception:
+        return colors
+    return colors
+
+
+def rgb_1000(hex_color: str) -> tuple[int, int, int]:
+    value = hex_color.lstrip("#")
+    red = int(value[0:2], 16)
+    green = int(value[2:4], 16)
+    blue = int(value[4:6], 16)
+    return round(red / 255 * 1000), round(green / 255 * 1000), round(blue / 255 * 1000)
 
 
 def row_attr(row: str, curses_module) -> int:
     if curses_module is None:
         return 0
     try:
-        if row.startswith("LIGHTHOUSE") or row.strip() == "LIGHTHOUSE":
+        if "LIGHTHOUSE" in row:
             return curses_module.color_pair(COLOR_PAIRS["title"]) | getattr(curses_module, "A_BOLD", 0)
-        if row.startswith("+") or row.startswith("|"):
-            return curses_module.color_pair(COLOR_PAIRS["border"])
-        if "[done]" in row:
+        if "▶" in row:
+            return curses_module.color_pair(COLOR_PAIRS["accent"]) | getattr(curses_module, "A_BOLD", 0)
+        if "KEEP" in row:
+            return curses_module.color_pair(COLOR_PAIRS["danger"]) | getattr(curses_module, "A_BOLD", 0)
+        if "WARN" in row:
+            return curses_module.color_pair(COLOR_PAIRS["warn"])
+        if "SAFE" in row or "DONE" in row:
             return curses_module.color_pair(COLOR_PAIRS["ok"])
-        if "[scan]" in row or "Checking " in row:
+        if "SCAN" in row or "Checking " in row:
             return curses_module.color_pair(COLOR_PAIRS["title"])
-        if "[wait]" in row:
+        if "WAIT" in row or "IDLE" in row:
             return curses_module.color_pair(COLOR_PAIRS["muted"])
+        if row.startswith("╭") or row.startswith("├") or row.startswith("╰"):
+            return curses_module.color_pair(COLOR_PAIRS["border"])
+        if row.startswith("+") or row.startswith("|") or row.startswith("│") or row.startswith("╳"):
+            return curses_module.color_pair(COLOR_PAIRS["panel"])
     except Exception:
         return 0
     return 0
@@ -526,7 +708,12 @@ def total_bytes(snapshot: dict[str, object]) -> int:
 
 
 def meter(percent: float, ascii_only: bool = False) -> str:
-    return bar(percent, 100, ascii_only, cells=24)
+    return framed_meter("DISK", percent, 24, ascii_only)
+
+
+def framed_meter(label: str, percent: float, width: int = 24, ascii_only: bool = False) -> str:
+    cells = max(4, width)
+    return f"{label} [{bar(percent, 100, ascii_only, cells)}] {percent:5.1f}%"
 
 
 def bar(value: float, max_value: float, ascii_only: bool = False, cells: int = 16) -> str:
@@ -534,6 +721,37 @@ def bar(value: float, max_value: float, ascii_only: bool = False, cells: int = 1
     on = "#" if ascii_only else "█"
     off = "." if ascii_only else "·"
     return on * active + off * (cells - active)
+
+
+def sparkline(values: Sequence[int], width: int, ascii_only: bool = False) -> str:
+    clean = [max(0, int(value)) for value in values if value is not None]
+    if not clean:
+        return "-" * max(1, width) if ascii_only else "·" * max(1, width)
+    glyphs = "._-*#@" if ascii_only else "▁▂▃▄▅▆▇█"
+    max_value = max(1, max(clean))
+    chars = [glyphs[min(len(glyphs) - 1, round((value / max_value) * (len(glyphs) - 1)))] for value in clean]
+    text = "".join(chars)
+    if len(text) >= width:
+        return text[-width:]
+    pad = "." if ascii_only else "·"
+    return text + pad * (width - len(text))
+
+
+def split_width(width: int, left_ratio: float) -> tuple[int, int]:
+    left = max(24, min(width - 25, round(width * left_ratio)))
+    return left, max(1, width - left - 1)
+
+
+def join_columns(columns: tuple[list[str], ...], width: int) -> list[str]:
+    height = max((len(column) for column in columns), default=0)
+    rows = []
+    for index in range(height):
+        parts = []
+        for column in columns:
+            column_width = len(column[0]) if column else 0
+            parts.append(column[index] if index < len(column) else " " * column_width)
+        rows.append(fit(" ".join(parts), width))
+    return rows
 
 
 def size_of(entry: dict[str, object] | None) -> int:
@@ -593,12 +811,23 @@ def panel(title: str, rows: list[str], width: int, height: int) -> list[str]:
     if width < 8 or height < 3:
         return [fit(row, width) for row in rows[:height]]
     title_text = f" {title} "
-    top = "+" + title_text[: max(0, width - 2)].ljust(width - 2, "-") + "+"
-    bottom = "+" + "-" * (width - 2) + "+"
+    top = "╭" + title_text[: max(0, width - 2)].ljust(width - 2, "─") + "╮"
+    bottom = "╰" + "─" * (width - 2) + "╯"
     body_height = max(0, height - 2)
-    body = [f"|{fit(row, width - 2)}|" for row in rows[:body_height]]
-    body.extend("|" + " " * (width - 2) + "|" for _ in range(body_height - len(body)))
+    body = [f"│{fit(row, width - 2)}│" for row in rows[:body_height]]
+    body.extend("│" + " " * (width - 2) + "│" for _ in range(body_height - len(body)))
     return [top] + body + ([bottom] if height > 1 else [])
+
+
+def chrome_bar(text: str, width: int, kind: str) -> str:
+    if width < 8:
+        return fit(text, width)
+    left, fill, right = {
+        "top": ("╭", "─", "╮"),
+        "bottom": ("╰", "─", "╯"),
+    }.get(kind, ("├", "─", "┤"))
+    body = fit(text, width - 2)
+    return left + body.rstrip().ljust(width - 2, fill) + right
 
 
 def string_list(value: object) -> list[str]:
