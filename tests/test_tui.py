@@ -63,11 +63,21 @@ class TuiTests(unittest.TestCase):
     def test_wide_overview_uses_btop_style_dashboard_panels(self) -> None:
         rows = tui.render(self.state("overview"), 120, 30)
 
-        self.assertTrue(any("Disk" in row for row in rows))
+        self.assertTrue(any("┐ Disk ┌" in row for row in rows))
         self.assertTrue(any("Review Queue" in row for row in rows))
         self.assertTrue(any("Scan Debugger" in row for row in rows))
         self.assertTrue(any("Growth History" in row for row in rows))
         self.assertTrue(any("Log Stream" in row for row in rows))
+        self.assertFalse(any("�" in row for row in rows))
+
+    def test_panel_uses_btop_title_cradle(self) -> None:
+        rows = tui.panel("Disk", ["body"], 24, 4)
+
+        self.assertIn("┐ Disk ┌", rows[0])
+        self.assertEqual(rows[0][0], "╭")
+        self.assertEqual(rows[0][-1], "╮")
+        self.assertEqual(rows[-1][0], "╰")
+        self.assertEqual(rows[-1][-1], "╯")
 
     def test_renderer_golden_review(self) -> None:
         rows = tui.render(self.state("review"), 72, 12)
@@ -211,6 +221,9 @@ class TuiTests(unittest.TestCase):
 
     def test_ascii_bar_fallback(self) -> None:
         self.assertEqual(tui.bar(50, 100, ascii_only=True, cells=4), "##..")
+
+    def test_unicode_bar_uses_btop_meter_symbol(self) -> None:
+        self.assertEqual(tui.bar(50, 100, cells=4), "■■··")
 
     def test_setup_colors_tolerates_limited_color_terminal(self) -> None:
         tui.setup_colors(FakeLimitedColorCurses())
