@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import locale
 import os
 import signal
 import sys
@@ -35,13 +36,54 @@ COLOR_PAIRS = {
 }
 
 PALETTE = {
-    "background": "#253954",
-    "panel": "#354b6a",
+    "background": "#111c2a",
+    "panel": "#253954",
     "danger": "#882139",
-    "accent": "#7c9cb3",
-    "border": "#64849b",
-    "text": "#bfc5ca",
+    "accent": "#bfc5ca",
+    "border": "#7c9cb3",
+    "text": "#dce4e9",
 }
+
+SYMBOLS = {
+    "h": "─",
+    "v": "│",
+    "lu": "╭",
+    "ru": "╮",
+    "ld": "╰",
+    "rd": "╯",
+    "title_left": "┐",
+    "title_right": "┌",
+    "meter": "■",
+    "meter_bg": "·",
+}
+
+BRAILLE_UP = (
+    " ",
+    "⢀",
+    "⢠",
+    "⢰",
+    "⢸",
+    "⡀",
+    "⣀",
+    "⣠",
+    "⣰",
+    "⣸",
+    "⡄",
+    "⣄",
+    "⣤",
+    "⣴",
+    "⣼",
+    "⡆",
+    "⣆",
+    "⣦",
+    "⣶",
+    "⣾",
+    "⡇",
+    "⣇",
+    "⣧",
+    "⣷",
+    "⣿",
+)
 
 CUSTOM_COLORS = {
     "background": 16,
@@ -99,6 +141,7 @@ class CursesTerminal:
         self._old_sigint = None
 
     def __enter__(self):
+        setup_locale()
         self.screen = self.curses.initscr()
         self.curses.noecho()
         self.curses.cbreak()
@@ -121,6 +164,13 @@ class CursesTerminal:
         if self._old_sigint is not None:
             signal.signal(signal.SIGINT, self._old_sigint)
         return False
+
+
+def setup_locale() -> None:
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
 
 
 def _raise_keyboard_interrupt(signum, frame) -> None:
@@ -718,8 +768,8 @@ def framed_meter(label: str, percent: float, width: int = 24, ascii_only: bool =
 
 def bar(value: float, max_value: float, ascii_only: bool = False, cells: int = 16) -> str:
     active = max(0, min(cells, round((value / max_value) * cells) if max_value else 0))
-    on = "#" if ascii_only else "█"
-    off = "." if ascii_only else "·"
+    on = "#" if ascii_only else SYMBOLS["meter"]
+    off = "." if ascii_only else SYMBOLS["meter_bg"]
     return on * active + off * (cells - active)
 
 
@@ -727,7 +777,7 @@ def sparkline(values: Sequence[int], width: int, ascii_only: bool = False) -> st
     clean = [max(0, int(value)) for value in values if value is not None]
     if not clean:
         return "-" * max(1, width) if ascii_only else "·" * max(1, width)
-    glyphs = "._-*#@" if ascii_only else "▁▂▃▄▅▆▇█"
+    glyphs = "._-*#@" if ascii_only else BRAILLE_UP
     max_value = max(1, max(clean))
     chars = [glyphs[min(len(glyphs) - 1, round((value / max_value) * (len(glyphs) - 1)))] for value in clean]
     text = "".join(chars)
@@ -810,24 +860,37 @@ def panel(title: str, rows: list[str], width: int, height: int) -> list[str]:
         return []
     if width < 8 or height < 3:
         return [fit(row, width) for row in rows[:height]]
-    title_text = f" {title} "
-    top = "╭" + title_text[: max(0, width - 2)].ljust(width - 2, "─") + "╮"
-    bottom = "╰" + "─" * (width - 2) + "╯"
+    top = titled_border(width, title, top=True)
+    bottom = titled_border(width, "", top=False)
     body_height = max(0, height - 2)
-    body = [f"│{fit(row, width - 2)}│" for row in rows[:body_height]]
-    body.extend("│" + " " * (width - 2) + "│" for _ in range(body_height - len(body)))
+    body = [f"{SYMBOLS['v']}{fit(row, width - 2)}{SYMBOLS['v']}" for row in rows[:body_height]]
+    body.extend(SYMBOLS["v"] + " " * (width - 2) + SYMBOLS["v"] for _ in range(body_height - len(body)))
     return [top] + body + ([bottom] if height > 1 else [])
 
 
 def chrome_bar(text: str, width: int, kind: str) -> str:
     if width < 8:
         return fit(text, width)
-    left, fill, right = {
-        "top": ("╭", "─", "╮"),
-        "bottom": ("╰", "─", "╯"),
-    }.get(kind, ("├", "─", "┤"))
-    body = fit(text, width - 2)
-    return left + body.rstrip().ljust(width - 2, fill) + right
+    if kind == "top":
+        return titled_border(width, text.strip(), top=True)
+    body = fit(f" {text.strip()} ", width - 2)
+    return SYMBOLS["v"] + body + SYMBOLS["v"]
+
+
+def titled_border(width: int, title: str, top: bool) -> str:
+    if width < 8:
+        return " " * max(0, width)
+    left = SYMBOLS["lu"] if top else SYMBOLS["ld"]
+    right = SYMBOLS["ru"] if top else SYMBOLS["rd"]
+    line = [left] + [SYMBOLS["h"]] * (width - 2) + [right]
+    if title and width >= 12:
+        title_text = f"{SYMBOLS['title_left']} {fit(title, max(1, width - 8)).rstrip()} {SYMBOLS['title_right']}"
+        if len(title_text) > width - 4:
+            title_text = title_text[: max(0, width - 5)] + SYMBOLS["title_right"]
+        start = 2
+        for index, char in enumerate(title_text[: width - start - 1]):
+            line[start + index] = char
+    return "".join(line)
 
 
 def string_list(value: object) -> list[str]:
