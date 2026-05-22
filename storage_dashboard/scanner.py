@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import os
 from pathlib import Path
 import stat
-from typing import Callable
+from typing import Callable, Iterable
 
 from storage_dashboard.classifier import SOURCE_MARKERS, Classification, classify_path
 
@@ -38,6 +39,9 @@ class ScanOptions:
     roots: tuple[Path, ...] = DEFAULT_ROOTS
     denied_roots: tuple[Path, ...] = DENIED_ROOTS
     read_only: bool = True
+    changed_paths: tuple[Path, ...] = ()
+    previous_entries: tuple[dict[str, object], ...] = ()
+    max_workers: int = 2
     excluded_names: frozenset[str] = field(
         default_factory=lambda: frozenset(
             {
@@ -116,6 +120,14 @@ def scan(options: ScanOptions | None = None, progress: ProgressCallback | None =
     if not options.read_only:
         raise ValueError("Scanner only supports read-only operation.")
 
+    if options.changed_paths and options.previous_entries:
+        return _scan_incremental(options, progress)
+    return _scan_full(options, progress)
+
+
+def _scan_full(options: ScanOptions, progress: ProgressCallback | None = None) -> ScanResult:
+    """Run a full root scan, optionally across a small root worker pool."""
+
     entries: list[ScanEntry] = []
     logs: list[ScanLog] = []
     roots = normalize_roots(tuple(options.roots))
@@ -131,6 +143,9 @@ def scan(options: ScanOptions | None = None, progress: ProgressCallback | None =
         entries_seen=0,
         logs_seen=0,
     )
+
+    if len(roots) > 1 and options.max_workers > 1:
+        return _scan_roots_parallel(options, roots, progress, completed_roots)
 
     for index, root in enumerate(roots):
         _emit_progress(
@@ -186,6 +201,270 @@ def scan(options: ScanOptions | None = None, progress: ProgressCallback | None =
     )
 
     return ScanResult(tuple(entries), tuple(logs))
+
+
+def _scan_roots_parallel(
+    options: ScanOptions,
+    roots: tuple[Path, ...],
+    progress: ProgressCallback | None,
+    completed_roots: list[str],
+) -> ScanResult:
+    entries_by_index: dict[int, list[ScanEntry]] = {}
+    logs_by_index: dict[int, list[ScanLog]] = {}
+    max_workers = max(1, min(options.max_workers, len(roots)))
+
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="lighthouse-root-scan") as executor:
+        future_to_index = {
+            executor.submit(_scan_root_worker, root, options, progress): index for index, root in enumerate(roots)
+        }
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            root_entries, root_logs = future.result()
+            entries_by_index[index] = root_entries
+            logs_by_index[index] = root_logs
+            completed_roots.append(str(roots[index]))
+            _emit_progress(
+                progress,
+                phase="root_complete",
+                active_root=str(roots[index]),
+                active_path=str(roots[index]),
+                completed_roots=list(completed_roots),
+                pending_roots=[str(root) for root in roots if str(root) not in completed_roots],
+                entries_seen=sum(len(items) for items in entries_by_index.values()),
+                logs_seen=sum(len(items) for items in logs_by_index.values()),
+            )
+
+    entries: list[ScanEntry] = []
+    logs: list[ScanLog] = []
+    for index in range(len(roots)):
+        entries.extend(entries_by_index.get(index, []))
+        logs.extend(logs_by_index.get(index, []))
+
+    _emit_progress(
+        progress,
+        phase="complete",
+        active_root=None,
+        active_path=None,
+        completed_roots=[str(root) for root in roots],
+        pending_roots=[],
+        entries_seen=len(entries),
+        logs_seen=len(logs),
+    )
+    return ScanResult(tuple(entries), tuple(logs))
+
+
+def _scan_root_worker(
+    root: Path,
+    options: ScanOptions,
+    progress: ProgressCallback | None = None,
+) -> tuple[list[ScanEntry], list[ScanLog]]:
+    logs: list[ScanLog] = []
+    _emit_progress(progress, phase="root", active_root=str(root), active_path=str(root), logs_seen=0)
+    if _is_denied(root, options.denied_roots):
+        logs.append(ScanLog(root, "denied_root", "Skipped denied root."))
+        return [_denied_entry(root)], logs
+
+    entries = _scan_path(root, root, options, logs, progress)
+    return list(entries or []), logs
+
+
+def _scan_incremental(options: ScanOptions, progress: ProgressCallback | None = None) -> ScanResult:
+    roots = normalize_roots(tuple(options.roots))
+    changed_paths = _collapse_changed_paths(
+        tuple(Path(path).expanduser() for path in options.changed_paths),
+        roots,
+    )
+    previous_entries = [
+        entry for entry in (_entry_from_mapping(item) for item in options.previous_entries) if entry is not None
+    ]
+
+    _emit_progress(
+        progress,
+        phase="incremental",
+        active_root=None,
+        active_path=None,
+        completed_roots=[],
+        pending_roots=[str(path) for path in changed_paths],
+        entries_seen=len(previous_entries),
+        logs_seen=0,
+    )
+
+    scanned_entries: list[ScanEntry] = []
+    logs: list[ScanLog] = []
+    if changed_paths:
+        if len(changed_paths) > 1 and options.max_workers > 1:
+            scanned_entries, logs = _scan_changed_paths_parallel(changed_paths, roots, options, progress)
+        else:
+            for path in changed_paths:
+                entries, path_logs = _scan_changed_path(path, roots, options, progress)
+                scanned_entries.extend(entries)
+                logs.extend(path_logs)
+
+    merged_entries = _merge_incremental_entries(previous_entries, scanned_entries, changed_paths, roots)
+    _emit_progress(
+        progress,
+        phase="complete",
+        active_root=None,
+        active_path=None,
+        completed_roots=[str(path) for path in changed_paths],
+        pending_roots=[],
+        entries_seen=len(merged_entries),
+        logs_seen=len(logs),
+    )
+    return ScanResult(tuple(merged_entries), tuple(logs))
+
+
+def _scan_changed_paths_parallel(
+    changed_paths: tuple[Path, ...],
+    roots: tuple[Path, ...],
+    options: ScanOptions,
+    progress: ProgressCallback | None,
+) -> tuple[list[ScanEntry], list[ScanLog]]:
+    entries_by_index: dict[int, list[ScanEntry]] = {}
+    logs_by_index: dict[int, list[ScanLog]] = {}
+    max_workers = max(1, min(options.max_workers, len(changed_paths)))
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="lighthouse-incremental-scan") as executor:
+        future_to_index = {
+            executor.submit(_scan_changed_path, path, roots, options, progress): index
+            for index, path in enumerate(changed_paths)
+        }
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            entries, logs = future.result()
+            entries_by_index[index] = entries
+            logs_by_index[index] = logs
+
+    entries: list[ScanEntry] = []
+    logs: list[ScanLog] = []
+    for index in range(len(changed_paths)):
+        entries.extend(entries_by_index.get(index, []))
+        logs.extend(logs_by_index.get(index, []))
+    return entries, logs
+
+
+def _scan_changed_path(
+    path: Path,
+    roots: tuple[Path, ...],
+    options: ScanOptions,
+    progress: ProgressCallback | None = None,
+) -> tuple[list[ScanEntry], list[ScanLog]]:
+    logs: list[ScanLog] = []
+    root = _root_for_path(path, roots)
+    if root is None or not os.path.lexists(path):
+        return [], logs
+    scanned = _scan_path(path, root, options, logs, progress)
+    return list(scanned or []), logs
+
+
+def _collapse_changed_paths(paths: tuple[Path, ...], roots: tuple[Path, ...]) -> tuple[Path, ...]:
+    in_scope = sorted(
+        {path for path in paths if _root_for_path(path, roots) is not None},
+        key=lambda item: (len(item.parts), str(item)),
+    )
+    collapsed: list[Path] = []
+    for path in in_scope:
+        if any(_same_or_child(path, existing) for existing in collapsed):
+            continue
+        collapsed.append(path)
+    return tuple(collapsed)
+
+
+def _merge_incremental_entries(
+    previous_entries: list[ScanEntry],
+    scanned_entries: list[ScanEntry],
+    changed_paths: tuple[Path, ...],
+    roots: tuple[Path, ...],
+) -> list[ScanEntry]:
+    retained = [
+        entry for entry in previous_entries if not any(_same_or_child(entry.path, path) for path in changed_paths)
+    ]
+    entries_by_path = {entry.path: entry for entry in retained}
+    for entry in scanned_entries:
+        entries_by_path[entry.path] = entry
+
+    for folder_path in _affected_ancestor_paths(changed_paths, roots):
+        entry = entries_by_path.get(folder_path)
+        if entry is None or entry.kind != "folder":
+            continue
+        size_bytes, file_count = _direct_child_totals(entries_by_path.values(), folder_path)
+        entries_by_path[folder_path] = ScanEntry(
+            path=entry.path,
+            kind=entry.kind,
+            size_bytes=size_bytes,
+            modified_at=entry.modified_at,
+            file_count=file_count,
+            root=entry.root,
+            classification=entry.classification,
+            reason=entry.reason,
+            risk=entry.risk,
+        )
+
+    return sorted(entries_by_path.values(), key=lambda entry: _entry_sort_key(entry, roots))
+
+
+def _affected_ancestor_paths(changed_paths: tuple[Path, ...], roots: tuple[Path, ...]) -> list[Path]:
+    ancestors: set[Path] = set()
+    for path in changed_paths:
+        root = _root_for_path(path, roots)
+        if root is None:
+            continue
+        current = path
+        while True:
+            ancestors.add(current)
+            if current == root:
+                break
+            current = current.parent
+    return sorted(ancestors, key=lambda item: len(item.parts), reverse=True)
+
+
+def _direct_child_totals(entries: Iterable[ScanEntry], folder_path: Path) -> tuple[int, int]:
+    size_bytes = 0
+    file_count = 0
+    for entry in entries:
+        if entry.path.parent != folder_path:
+            continue
+        size_bytes += entry.size_bytes
+        if entry.kind == "folder":
+            file_count += entry.file_count or 0
+        else:
+            file_count += 1
+    return size_bytes, file_count
+
+
+def _entry_sort_key(entry: ScanEntry, roots: tuple[Path, ...]) -> tuple[int, int, str]:
+    root_lookup = {root: index for index, root in enumerate(roots)}
+    return (root_lookup.get(entry.root, len(roots)), len(entry.path.parts), str(entry.path))
+
+
+def _root_for_path(path: Path, roots: tuple[Path, ...]) -> Path | None:
+    matches = [root for root in roots if path == root or path.is_relative_to(root)]
+    if not matches:
+        return None
+    return max(matches, key=lambda root: len(root.parts))
+
+
+def _same_or_child(path: Path, parent: Path) -> bool:
+    return path == parent or path.is_relative_to(parent)
+
+
+def _entry_from_mapping(data: dict[str, object]) -> ScanEntry | None:
+    try:
+        path = Path(str(data["path"]))
+        root = Path(str(data.get("root") or path))
+        file_count = data.get("file_count")
+        return ScanEntry(
+            path=path,
+            kind=str(data["kind"]),
+            size_bytes=int(data.get("size_bytes", 0)),
+            modified_at=data.get("modified_at") if isinstance(data.get("modified_at"), str) else None,
+            file_count=int(file_count) if isinstance(file_count, int) else None,
+            root=root,
+            classification=str(data.get("classification", "do_not_touch")),
+            reason=str(data.get("reason", "unclassified")),
+            risk=str(data.get("risk", "high")),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _scan_path(

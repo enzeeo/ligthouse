@@ -34,6 +34,10 @@ COLOR_PAIRS = {
     "background": 8,
     "panel": 9,
 }
+RUNNING_REFRESH_SECONDS = 0.2
+IDLE_REFRESH_SECONDS = 1.0
+RUNNING_SLEEP_SECONDS = 0.05
+IDLE_SLEEP_SECONDS = 0.2
 
 PALETTE = {
     "background": "#111c2a",
@@ -84,6 +88,9 @@ BRAILLE_UP = (
     "⣷",
     "⣿",
 )
+
+BORDER_CHARS = frozenset("╭╮╰╯─│├┤┬┴┐┌")
+METER_CHARS = frozenset((SYMBOLS["meter"], *BRAILLE_UP[1:]))
 
 CUSTOM_COLORS = {
     "background": 16,
@@ -145,6 +152,10 @@ class CursesTerminal:
         self.screen = self.curses.initscr()
         self.curses.noecho()
         self.curses.cbreak()
+        try:
+            self.curses.curs_set(0)
+        except Exception:
+            pass
         self.screen.keypad(True)
         self.screen.nodelay(True)
         setup_colors(self.curses)
@@ -158,6 +169,10 @@ class CursesTerminal:
                 self.screen.keypad(False)
             except Exception:
                 pass
+        try:
+            self.curses.curs_set(1)
+        except Exception:
+            pass
         self.curses.nocbreak()
         self.curses.echo()
         self.curses.endwin()
@@ -179,6 +194,7 @@ def _raise_keyboard_interrupt(signum, frame) -> None:
 
 def _loop(screen, curses, runtime: ScanRuntime) -> None:
     state = load_state(runtime)
+    next_runtime_refresh = time.monotonic() + runtime_refresh_interval(state.status)
     while True:
         height, width = screen.getmaxyx()
         draw(screen, render(state, width, height), curses)
@@ -190,10 +206,27 @@ def _loop(screen, curses, runtime: ScanRuntime) -> None:
             if action.name == "refresh":
                 start = runtime.start_background_scan()
                 state = replace(state, notice="Scan already running." if start.status == "running" else "Scan started.")
+                state = merge_runtime(state, runtime)
+                next_runtime_refresh = time.monotonic() + runtime_refresh_interval(state.status)
             else:
                 state = reduce_state(state, action, width, height)
-        state = merge_runtime(state, runtime)
-        time.sleep(0.05)
+        now = time.monotonic()
+        if now >= next_runtime_refresh:
+            state = merge_runtime(state, runtime)
+            next_runtime_refresh = now + runtime_refresh_interval(state.status)
+        time.sleep(loop_sleep_interval(state.status))
+
+
+def runtime_refresh_interval(status: dict[str, object] | None) -> float:
+    if (status or {}).get("status") == "running":
+        return RUNNING_REFRESH_SECONDS
+    return IDLE_REFRESH_SECONDS
+
+
+def loop_sleep_interval(status: dict[str, object] | None) -> float:
+    if (status or {}).get("status") == "running":
+        return RUNNING_SLEEP_SECONDS
+    return IDLE_SLEEP_SECONDS
 
 
 def load_state(runtime: ScanRuntime) -> TuiState:
@@ -439,7 +472,7 @@ def review_queue_rows(state: TuiState) -> list[str]:
         return ["No safe review candidates yet."]
     rows = []
     for item in suggestions[:6]:
-        rows.append(f"{risk_label(item)} {format_bytes(item.get('size_bytes')):>7} {item.get('path', '')}")
+        rows.append(f"{risk_label(item)} {format_bytes(item.get('size_bytes')):>7} {compact_path(item.get('path'), 64)}")
     return rows
 
 
@@ -450,7 +483,9 @@ def folder_meter_rows(state: TuiState, width: int) -> list[str]:
     max_size = max(1, *(int(root["size"]) for root in roots))
     rows = []
     for root in roots[:5]:
-        rows.append(f"{format_bytes(root['size']):>7} {bar(root['size'], max_size, state.use_ascii, max(4, min(18, width // 4)))} {root['path']}")
+        rows.append(
+            f"{format_bytes(root['size']):>7} {bar(root['size'], max_size, state.use_ascii, max(4, min(18, width // 4)))} {compact_path(root['path'], 42)}"
+        )
     return rows
 
 
@@ -460,7 +495,7 @@ def log_stream_rows(state: TuiState) -> list[str]:
         return ["No scanner events."]
     rows = []
     for item in logs[-6:]:
-        rows.append(f"{item.get('event', '')} {item.get('message', '')} {item.get('path', '')}")
+        rows.append(f"{item.get('event', '')} {item.get('message', '')} {compact_path(item.get('path'), 46)}")
     return rows
 
 
@@ -498,7 +533,7 @@ def debugger_rows(state: TuiState) -> list[str]:
             marker = "WAIT"
         else:
             marker = "IDLE"
-        rows.append(f"{marker} {root}")
+        rows.append(f"{marker} {compact_path(root, 54)}")
     return rows
 
 
@@ -524,7 +559,7 @@ def running_line(state: TuiState) -> str:
     pending = string_list(status.get("pending_roots"))
     target = active_path or active_root or (pending[0] if pending else None)
     if status.get("status") == "running" and target:
-        return f"Checking {target}"
+        return f"Checking {compact_path(target, 64)}"
     return "Scan idle"
 
 
@@ -555,6 +590,8 @@ def format_cell(item: dict[str, object], field: str) -> str:
         return format_bytes(value)
     if field == "classification":
         return risk_label(item)
+    if field == "path":
+        return compact_path(value, 76)
     return str(value or "")
 
 
@@ -572,7 +609,7 @@ def detail_rows(item: dict[str, object] | None) -> list[str]:
         rows.append(f"Reason {item.get('reason')}")
     rows.extend(
         [
-            f"Path   {item.get('path', '')}",
+            f"Path   {compact_path(item.get('path'), 72)}",
             "Mode   read-only",
         ]
     )
@@ -609,18 +646,46 @@ def draw(screen, rows: list[str], curses_module=None) -> None:
             pass
     screen.erase()
     for y, row in enumerate(rows):
-        try:
-            attr = row_attr(row, curses_module)
-            if attr:
-                screen.addstr(y, 0, row, attr)
-            else:
-                screen.addstr(y, 0, row)
-        except Exception:
-            try:
-                screen.addstr(y, 0, row)
-            except Exception:
-                pass
+        draw_row(screen, y, row, curses_module)
     screen.refresh()
+
+
+def draw_row(screen, y: int, row: str, curses_module) -> None:
+    if curses_module is None:
+        try:
+            screen.addstr(y, 0, row)
+        except Exception:
+            pass
+        return
+    base_attr = row_attr(row, curses_module) or safe_color_pair(curses_module, "background")
+    for x, char in enumerate(row):
+        try:
+            screen.addstr(y, x, char, char_attr(row, char, base_attr, curses_module))
+        except Exception:
+            pass
+
+
+def char_attr(row: str, char: str, base_attr: int, curses_module) -> int:
+    if char in BORDER_CHARS:
+        return safe_color_pair(curses_module, "border")
+    if char in METER_CHARS:
+        return safe_color_pair(curses_module, "title") | getattr(curses_module, "A_BOLD", 0)
+    if "KEEP" in row and char.strip():
+        return safe_color_pair(curses_module, "danger") | getattr(curses_module, "A_BOLD", 0)
+    if "WARN" in row and char.strip():
+        return safe_color_pair(curses_module, "warn")
+    if ("SAFE" in row or "DONE" in row) and char.strip():
+        return safe_color_pair(curses_module, "ok")
+    if ("WAIT" in row or "IDLE" in row) and char.strip():
+        return safe_color_pair(curses_module, "muted")
+    return base_attr
+
+
+def safe_color_pair(curses_module, name: str) -> int:
+    try:
+        return curses_module.color_pair(COLOR_PAIRS[name])
+    except Exception:
+        return 0
 
 
 def setup_colors(curses_module) -> None:
@@ -646,7 +711,7 @@ def setup_colors(curses_module) -> None:
 
 def color_ids(curses_module) -> dict[str, int]:
     colors = {
-        "background": getattr(curses_module, "COLOR_BLUE", -1),
+        "background": getattr(curses_module, "COLOR_BLACK", -1),
         "panel": getattr(curses_module, "COLOR_BLUE", -1),
         "danger": getattr(curses_module, "COLOR_RED", getattr(curses_module, "COLOR_MAGENTA", -1)),
         "accent": getattr(curses_module, "COLOR_CYAN", getattr(curses_module, "COLOR_BLUE", -1)),
@@ -658,6 +723,8 @@ def color_ids(curses_module) -> dict[str, int]:
         color_count = int(getattr(curses_module, "COLORS", 0))
     except Exception:
         return colors
+    if color_count >= 256 and not can_change:
+        return {name: rgb_256(PALETTE[name]) for name in colors}
     if not can_change or color_count <= max(CUSTOM_COLORS.values()):
         return colors
     try:
@@ -667,6 +734,20 @@ def color_ids(curses_module) -> dict[str, int]:
     except Exception:
         return colors
     return colors
+
+
+def rgb_256(hex_color: str) -> int:
+    value = hex_color.lstrip("#")
+    red = int(value[0:2], 16)
+    green = int(value[2:4], 16)
+    blue = int(value[4:6], 16)
+    if red == green == blue:
+        if red < 8:
+            return 16
+        if red > 248:
+            return 231
+        return round(((red - 8) / 247) * 24) + 232
+    return 16 + (36 * round(red / 255 * 5)) + (6 * round(green / 255 * 5)) + round(blue / 255 * 5)
 
 
 def rgb_1000(hex_color: str) -> tuple[int, int, int]:
@@ -829,6 +910,30 @@ def format_bytes(value: object) -> str:
         unit += 1
     precision = 0 if unit == 0 or abs(size) >= 10 else 1
     return f"{size:.{precision}f}{units[unit]}"
+
+
+def compact_path(value: object, width: int) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    home = os.path.expanduser("~")
+    if home and text.startswith(home):
+        text = "~" + text[len(home) :]
+    if len(text) <= width:
+        return text
+
+    parts = text.split("/")
+    if len(parts) >= 6:
+        head = "/".join(parts[:3])
+        tail = "/".join(parts[-3:])
+        candidate = f"{head}/.../{tail}"
+        if len(candidate) <= width:
+            return candidate
+    if width <= 4:
+        return text[:width]
+    head_width = max(1, width // 2 - 2)
+    tail_width = max(1, width - head_width - 3)
+    return f"{text[:head_width]}...{text[-tail_width:]}"
 
 
 def short_time(value: object) -> str:

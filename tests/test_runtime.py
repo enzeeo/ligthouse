@@ -28,6 +28,40 @@ class SlowScanner:
         return {"entries": [], "logs": []}
 
 
+class CapturingScanner:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.options = None
+
+    def scan(self, options=None, progress=None):
+        self.calls += 1
+        self.options = options
+        return {"entries": [], "logs": []}
+
+
+class FakeFSEvents:
+    def __init__(self, *, changed_paths=(), current_event_id=101, must_full_scan=False, supported=True) -> None:
+        self.changed_paths = tuple(Path(path) for path in changed_paths)
+        self.current = current_event_id
+        self.must_full_scan = must_full_scan
+        self.supported = supported
+        self.calls = 0
+
+    def current_event_id(self):
+        return self.current
+
+    def changes_since(self, roots, since_event_id):
+        self.calls += 1
+        from storage_dashboard.fsevents import FSEventChanges
+
+        return FSEventChanges(
+            supported=self.supported,
+            current_event_id=self.current,
+            changed_paths=self.changed_paths,
+            must_full_scan=self.must_full_scan,
+        )
+
+
 class RuntimeTests(unittest.TestCase):
     def runtime(self, temp_dir: str, **kwargs) -> ScanRuntime:
         root = Path(temp_dir) / "root"
@@ -116,6 +150,65 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertIsNone(runtime.latest_compatible_snapshot())
             self.assertFalse(runtime.has_fresh_compatible_snapshot())
+
+    def test_no_fsevents_changes_reuses_latest_snapshot_without_scanning(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            scanner = CapturingScanner()
+            fsevents = FakeFSEvents(changed_paths=(), current_event_id=101)
+            runtime = self.runtime(temp_dir, scanner=scanner, fsevents=fsevents)
+            snapshot = add_snapshot(runtime, minutes_old=1)
+            snapshot["fsevents_event_id"] = 100
+            snapshot["fsevents_roots_fingerprint"] = roots_fingerprint(runtime.roots)
+            write_snapshots(runtime.store.path, [snapshot])
+
+            result = runtime.run_scan()
+
+        self.assertEqual(result["id"], snapshot["id"])
+        self.assertEqual(scanner.calls, 0)
+        self.assertEqual(fsevents.calls, 1)
+
+    def test_fsevents_dirty_paths_run_incremental_scan_options(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "root"
+            dirty = root / "dirty"
+            scanner = CapturingScanner()
+            runtime = self.runtime(
+                temp_dir,
+                scanner=scanner,
+                fsevents=FakeFSEvents(changed_paths=(dirty,), current_event_id=102),
+            )
+            snapshot = add_snapshot(runtime, minutes_old=1)
+            snapshot["entries"] = [{"path": str(root), "kind": "folder", "size_bytes": 0, "root": str(root)}]
+            snapshot["fsevents_event_id"] = 100
+            snapshot["fsevents_roots_fingerprint"] = roots_fingerprint(runtime.roots)
+            write_snapshots(runtime.store.path, [snapshot])
+
+            result = runtime.run_scan()
+
+        self.assertEqual(scanner.calls, 1)
+        self.assertEqual(scanner.options.changed_paths, (dirty,))
+        self.assertEqual(scanner.options.previous_entries, tuple(snapshot["entries"]))
+        self.assertEqual(result["fsevents_event_id"], 102)
+        self.assertEqual(result["fsevents_roots_fingerprint"], roots_fingerprint(runtime.roots))
+
+    def test_fsevents_dropped_events_fall_back_to_full_scan(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            scanner = CapturingScanner()
+            runtime = self.runtime(
+                temp_dir,
+                scanner=scanner,
+                fsevents=FakeFSEvents(changed_paths=(Path(temp_dir) / "root",), must_full_scan=True),
+            )
+            snapshot = add_snapshot(runtime, minutes_old=1)
+            snapshot["fsevents_event_id"] = 100
+            snapshot["fsevents_roots_fingerprint"] = roots_fingerprint(runtime.roots)
+            write_snapshots(runtime.store.path, [snapshot])
+
+            runtime.run_scan()
+
+        self.assertEqual(scanner.calls, 1)
+        self.assertEqual(scanner.options.changed_paths, ())
+        self.assertEqual(scanner.options.previous_entries, ())
 
 
 class EmptyScanner:

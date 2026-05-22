@@ -59,3 +59,10 @@
 - Decided: Use best-effort curses background/color pairs with fallback for limited terminals; tests should assert text markers/layout behavior, not exact terminal RGB output.
 - Why: User wants the TUI to mimic btop’s dense panel style while matching the Lighthouse palette more closely.
 - Rejected: New TUI dependencies, destructive actions, web dashboard changes, and relying on exact truecolor support.
+
+### 2026-05-22 - Battery-Aware Scanner
+- Decided: Use best-effort macOS FSEvents metadata to skip full scans when no watched roots changed, and fall back to the full safe scanner whenever FSEvents is unavailable, dropped, wrapped, or root-changed.
+- Decided: Incremental scans rescan only changed subtrees, merge them into the previous snapshot, recompute affected ancestor totals, and keep one global scan lock.
+- Decided: Cap parallel root/subtree scanning at a small worker count, default 2, and slow idle TUI runtime polling.
+- Why: Reduces repeated disk traversal and timer wakeups while preserving read-only, stdlib-only, local-only safety.
+- Rejected: Always-fast uncapped scanning, external watcher dependencies, and destructive filesystem actions.

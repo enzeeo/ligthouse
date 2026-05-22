@@ -12,10 +12,12 @@ from pathlib import Path
 import shutil
 import threading
 
+from storage_dashboard.fsevents import FSEventChanges, MacFSEvents
 from storage_dashboard import scanner as filesystem_scanner
+from storage_dashboard.scanner import ScanOptions
 from storage_dashboard.store import SnapshotStore
 
-SNAPSHOT_SCHEMA_VERSION = 1
+SNAPSHOT_SCHEMA_VERSION = 2
 DEFAULT_FRESHNESS = timedelta(minutes=15)
 
 
@@ -26,8 +28,8 @@ class ScanAlreadyRunningError(RuntimeError):
 class LocalScanner:
     """Default scanner adapter for app use."""
 
-    def scan(self, progress=None) -> object:
-        return filesystem_scanner.scan(progress=progress)
+    def scan(self, options=None, progress=None) -> object:
+        return filesystem_scanner.scan(options=options, progress=progress)
 
 
 @dataclass(frozen=True)
@@ -78,13 +80,17 @@ class ScanRuntime:
         roots: tuple[Path, ...] = filesystem_scanner.DEFAULT_ROOTS,
         freshness: timedelta = DEFAULT_FRESHNESS,
         lock_path: Path | None = None,
+        fsevents: object | None = None,
+        max_scan_workers: int = 2,
     ) -> None:
         self.store = store or SnapshotStore()
         self.scanner = scanner or LocalScanner()
+        self.fsevents = fsevents or MacFSEvents()
         self.disk_path = disk_path or Path.home()
         self.roots = tuple(Path(root).expanduser() for root in roots)
         self.freshness = freshness
         self.lock_path = lock_path or self.store.path.parent / ".scan.lock"
+        self.max_scan_workers = max(1, max_scan_workers)
         self._scan_lock = threading.Lock()
         self._status_lock = threading.Lock()
         self._status: dict[str, object] = self._base_status()
@@ -191,17 +197,44 @@ class ScanRuntime:
             error=None,
         )
         try:
-            result = self._run_scanner()
+            latest = self.latest_compatible_snapshot()
+            changes = self._fsevents_changes(latest)
+            if self._can_reuse_snapshot(latest, changes):
+                entries = latest.get("entries", [])
+                logs = latest.get("logs", [])
+                self._set_status(
+                    status="completed",
+                    phase="complete",
+                    active_root=None,
+                    active_path=None,
+                    pending_roots=[],
+                    entries_seen=len(entries) if isinstance(entries, list) else 0,
+                    logs_seen=len(logs) if isinstance(logs, list) else 0,
+                    finished_at=_utc_now(),
+                    snapshot_id=latest.get("id"),
+                    error=None,
+                )
+                return latest
+
+            scan_options = self._scan_options(latest, changes)
+            fsevents_event_id = self._event_id_for_snapshot(changes)
+            result = self._run_scanner(scan_options)
             entries = entries_from_result(result)
             logs = logs_from_result(result)
             roots = roots_from_entries(entries, default_roots=self.roots)
+            snapshot_args = {
+                "roots": roots,
+                "disk": self.disk_summary(),
+                "entries": entries,
+                "logs": logs,
+                "schema_version": SNAPSHOT_SCHEMA_VERSION,
+                "roots_fingerprint": self.roots_fingerprint,
+            }
+            if fsevents_event_id is not None:
+                snapshot_args["fsevents_event_id"] = fsevents_event_id
+                snapshot_args["fsevents_roots_fingerprint"] = self.roots_fingerprint
             snapshot = self.store.add_snapshot(
-                roots=roots,
-                disk=self.disk_summary(),
-                entries=entries,
-                logs=logs,
-                schema_version=SNAPSHOT_SCHEMA_VERSION,
-                roots_fingerprint=self.roots_fingerprint,
+                **snapshot_args,
             )
             self._set_status(
                 status="completed",
@@ -223,15 +256,80 @@ class ScanRuntime:
             advisory_lock.release()
             self._scan_lock.release()
 
-    def _run_scanner(self) -> object:
+    def _run_scanner(self, options: ScanOptions) -> object:
         scan = self.scanner.scan
         parameters = inspect.signature(scan).parameters
         accepts_progress = "progress" in parameters or any(
             parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
         )
+        accepts_options = "options" in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        )
+        kwargs: dict[str, object] = {}
+        if accepts_options:
+            kwargs["options"] = options
         if accepts_progress:
-            return scan(progress=self._update_scan_progress)
-        return scan()
+            kwargs["progress"] = self._update_scan_progress
+        return scan(**kwargs)
+
+    def _fsevents_changes(self, latest: dict[str, object] | None) -> FSEventChanges | None:
+        if not isinstance(latest, dict):
+            return None
+        if latest.get("fsevents_roots_fingerprint") != self.roots_fingerprint:
+            return None
+        event_id = latest.get("fsevents_event_id")
+        if not isinstance(event_id, int):
+            return None
+        changes_since = getattr(self.fsevents, "changes_since", None)
+        if not callable(changes_since):
+            return None
+        try:
+            return changes_since(self.roots, event_id)
+        except Exception:
+            return FSEventChanges(supported=False, current_event_id=None, must_full_scan=True)
+
+    def _can_reuse_snapshot(
+        self,
+        latest: dict[str, object] | None,
+        changes: FSEventChanges | None,
+    ) -> bool:
+        return (
+            isinstance(latest, dict)
+            and changes is not None
+            and changes.supported
+            and not changes.must_full_scan
+            and not changes.changed_paths
+        )
+
+    def _scan_options(self, latest: dict[str, object] | None, changes: FSEventChanges | None) -> ScanOptions:
+        if (
+            isinstance(latest, dict)
+            and changes is not None
+            and changes.supported
+            and not changes.must_full_scan
+            and changes.changed_paths
+        ):
+            previous_entries = tuple(item for item in latest.get("entries", []) if isinstance(item, dict))
+            if previous_entries:
+                return ScanOptions(
+                    roots=self.roots,
+                    changed_paths=tuple(Path(path).expanduser() for path in changes.changed_paths),
+                    previous_entries=previous_entries,
+                    max_workers=self.max_scan_workers,
+                )
+        return ScanOptions(roots=self.roots, max_workers=self.max_scan_workers)
+
+    def _event_id_for_snapshot(self, changes: FSEventChanges | None) -> int | None:
+        if changes is not None and changes.current_event_id is not None:
+            return changes.current_event_id
+        current_event_id = getattr(self.fsevents, "current_event_id", None)
+        if not callable(current_event_id):
+            return None
+        try:
+            event_id = current_event_id()
+        except Exception:
+            return None
+        return event_id if isinstance(event_id, int) else None
 
     def _update_scan_progress(self, progress: dict[str, object]) -> None:
         allowed = {

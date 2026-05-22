@@ -69,6 +69,7 @@ class TuiTests(unittest.TestCase):
         self.assertTrue(any("Growth History" in row for row in rows))
         self.assertTrue(any("Log Stream" in row for row in rows))
         self.assertFalse(any("�" in row for row in rows))
+        self.assertFalse(any("/Users/enzeeo/Documents/HRI/misty-helping-study1/venv/lib/python3.11/site-packages" in row for row in rows))
 
     def test_panel_uses_btop_title_cradle(self) -> None:
         rows = tui.panel("Disk", ["body"], 24, 4)
@@ -225,6 +226,11 @@ class TuiTests(unittest.TestCase):
     def test_unicode_bar_uses_btop_meter_symbol(self) -> None:
         self.assertEqual(tui.bar(50, 100, cells=4), "■■··")
 
+    def test_compact_path_shortens_long_home_paths(self) -> None:
+        path = "/Users/enzeeo/Documents/HRI/misty-helping-study1/venv/lib/python3.11/site-packages/langchain/agents/foo.py"
+
+        self.assertEqual(tui.compact_path(path, 43), "~/Documents/HRI/.../langchain/agents/foo.py")
+
     def test_setup_colors_tolerates_limited_color_terminal(self) -> None:
         tui.setup_colors(FakeLimitedColorCurses())
 
@@ -236,6 +242,17 @@ class TuiTests(unittest.TestCase):
         tui.draw(screen, ["LIGHTHOUSE"], curses)
 
         self.assertTrue(screen.backgrounds)
+        self.assertEqual(len(screen.added), len("LIGHTHOUSE"))
+        self.assertTrue(all(len(text) == 1 for _y, _x, text, _attrs in screen.added))
+
+    def test_256_color_palette_uses_non_basic_background(self) -> None:
+        curses = FakeColor256Curses()
+
+        tui.setup_colors(curses)
+
+        background_pairs = [pair for pair in curses.pairs if pair[0] == tui.COLOR_PAIRS["background"]]
+        self.assertTrue(background_pairs)
+        self.assertGreaterEqual(background_pairs[0][2], 16)
 
     def test_terminal_cleanup_on_exception_and_sigint_handler_restore(self) -> None:
         curses = FakeCurses()
@@ -261,6 +278,14 @@ class TuiTests(unittest.TestCase):
             tui._loop(screen, FakeCurses(), runtime)
 
         self.assertTrue(screen.refreshed)
+
+    def test_idle_loop_does_not_reload_runtime_state_every_tick(self) -> None:
+        screen = FakeScreen(keys=[-1, ord("q")])
+        runtime = CountingRuntime()
+        with patch("storage_dashboard.tui.time.sleep"), patch("storage_dashboard.tui.time.monotonic", side_effect=[0.0, 0.1]):
+            tui._loop(screen, FakeCurses(), runtime)
+
+        self.assertEqual(runtime.latest_calls, 1)
 
 
 class FakeCurses:
@@ -343,11 +368,19 @@ class FakeColorCurses(FakeLimitedColorCurses):
         return pair << 16
 
 
+class FakeColor256Curses(FakeColorCurses):
+    COLORS = 256
+
+    def can_change_color(self):
+        return False
+
+
 class FakeScreen:
     def __init__(self, keys=None) -> None:
         self.keys = list(keys or [])
         self.refreshed = False
         self.backgrounds = []
+        self.added = []
 
     def keypad(self, _value):
         pass
@@ -365,7 +398,7 @@ class FakeScreen:
         self.backgrounds.append(args)
 
     def addstr(self, _y, _x, _text, *_attrs):
-        pass
+        self.added.append((_y, _x, _text, _attrs))
 
     def refresh(self):
         self.refreshed = True
@@ -398,6 +431,20 @@ class FakeRuntime:
     @property
     def store(self):
         return FakeStore()
+
+
+class CountingRuntime(FakeRuntime):
+    def __init__(self) -> None:
+        self.latest_calls = 0
+        self._store = FakeStore()
+
+    def latest_compatible_snapshot(self):
+        self.latest_calls += 1
+        return SNAPSHOT
+
+    @property
+    def store(self):
+        return self._store
 
 
 class FakeStore:

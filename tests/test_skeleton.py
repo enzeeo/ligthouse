@@ -228,6 +228,77 @@ class SkeletonTests(unittest.TestCase):
         self.assertEqual(node_modules_entry.file_count, 1)
         self.assertTrue(any(log.event == "symlink_skipped" for log in result.logs))
 
+    def test_incremental_scan_replaces_dirty_subtree_and_recomputes_ancestors(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            keep = root / "keep"
+            dirty = root / "dirty"
+            keep.mkdir()
+            dirty.mkdir()
+            (keep / "same.bin").write_bytes(b"12")
+            (dirty / "old.bin").write_bytes(b"123")
+            baseline = scan(ScanOptions(roots=(root,)))
+
+            (dirty / "old.bin").unlink()
+            (dirty / "new.bin").write_bytes(b"12345")
+            result = scan(
+                ScanOptions(
+                    roots=(root,),
+                    changed_paths=(dirty,),
+                    previous_entries=tuple(entry.to_dict() for entry in baseline.entries),
+                )
+            )
+
+        root_entry = next(entry for entry in result.entries if entry.path == root)
+        dirty_entry = next(entry for entry in result.entries if entry.path == dirty)
+        self.assertEqual(root_entry.size_bytes, 7)
+        self.assertEqual(root_entry.file_count, 2)
+        self.assertEqual(dirty_entry.size_bytes, 5)
+        self.assertTrue(any(entry.path == keep / "same.bin" for entry in result.entries))
+        self.assertFalse(any(entry.path.name == "old.bin" for entry in result.entries))
+
+    def test_incremental_scan_removes_deleted_subtree(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            keep = root / "keep.bin"
+            dirty = root / "dirty"
+            dirty.mkdir()
+            keep.write_bytes(b"12")
+            (dirty / "old.bin").write_bytes(b"123")
+            baseline = scan(ScanOptions(roots=(root,)))
+
+            (dirty / "old.bin").unlink()
+            dirty.rmdir()
+            result = scan(
+                ScanOptions(
+                    roots=(root,),
+                    changed_paths=(dirty,),
+                    previous_entries=tuple(entry.to_dict() for entry in baseline.entries),
+                )
+            )
+
+        root_entry = next(entry for entry in result.entries if entry.path == root)
+        self.assertEqual(root_entry.size_bytes, 2)
+        self.assertEqual(root_entry.file_count, 1)
+        self.assertFalse(any(dirty == entry.path or dirty in entry.path.parents for entry in result.entries))
+
+    def test_parallel_root_scan_matches_serial_root_scan(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root_a = Path(temp_dir) / "a"
+            root_b = Path(temp_dir) / "b"
+            root_a.mkdir()
+            root_b.mkdir()
+            (root_a / "one.bin").write_bytes(b"12")
+            (root_b / "two.bin").write_bytes(b"123")
+
+            serial = scan(ScanOptions(roots=(root_a, root_b), max_workers=1))
+            parallel = scan(ScanOptions(roots=(root_a, root_b), max_workers=2))
+
+        self.assertEqual(
+            sorted((entry.to_dict() for entry in serial.entries), key=lambda item: item["path"]),
+            sorted((entry.to_dict() for entry in parallel.entries), key=lambda item: item["path"]),
+        )
+
     def test_scanner_passes_modified_time_for_download_archive_age(self) -> None:
         with TemporaryDirectory() as temp_dir:
             downloads = Path(temp_dir) / "Downloads"
