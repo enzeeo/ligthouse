@@ -66,3 +66,11 @@
 - Decided: Cap parallel root/subtree scanning at a small worker count, default 2, and slow idle TUI runtime polling.
 - Why: Reduces repeated disk traversal and timer wakeups while preserving read-only, stdlib-only, local-only safety.
 - Rejected: Always-fast uncapped scanning, external watcher dependencies, and destructive filesystem actions.
+
+### 2026-05-22 - Staged Scanner Strategy
+- Decided: Add exact, summary, and lazy scan modes with `size_status` metadata so the UI can distinguish exact, cached, and partial byte totals.
+- Decided: Publish a partial summary snapshot before long exact scans when the scanner supports options, but never treat partial snapshots as compatible/fresh for reuse.
+- Decided: Keep expensive folders collapsed by default, reuse cached exact totals for shallow display, and rescan a collapsed folder when FSEvents reports a change inside it.
+- Decided: Add `POST /api/scan/path` for read-only lazy subtree scans and throttle hot-path progress updates.
+- Why: Improves perceived scan speed without switching languages or reading file contents.
+- Rejected: C++ rewrite, destructive cleanup controls, and trusting cached/partial sizes as deletion-safe proof.

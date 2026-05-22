@@ -8,11 +8,23 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import stat
+import time
 from typing import Callable, Iterable
 
 from storage_dashboard.classifier import SOURCE_MARKERS, Classification, classify_path
 
 ProgressCallback = Callable[[dict[str, object]], None]
+
+SCAN_MODE_EXACT = "exact"
+SCAN_MODE_SUMMARY = "summary"
+SCAN_MODE_LAZY = "lazy"
+SIZE_STATUS_EXACT = "exact"
+SIZE_STATUS_CACHED = "cached"
+SIZE_STATUS_PARTIAL = "partial"
+SCAN_DEPTH_RECURSIVE = "recursive"
+SCAN_DEPTH_SHALLOW = "shallow"
+SCAN_MODES = frozenset({SCAN_MODE_EXACT, SCAN_MODE_SUMMARY, SCAN_MODE_LAZY})
+ALWAYS_EMIT_PHASES = frozenset({"starting", "root", "root_complete", "incremental", "complete", "failed"})
 
 DEFAULT_ROOTS = (
     Path.home() / "Downloads",
@@ -41,6 +53,11 @@ class ScanOptions:
     read_only: bool = True
     changed_paths: tuple[Path, ...] = ()
     previous_entries: tuple[dict[str, object], ...] = ()
+    mode: str = SCAN_MODE_EXACT
+    target_path: Path | None = None
+    reuse_cached_totals: bool = True
+    progress_interval_seconds: float = 0.1
+    progress_interval_entries: int = 250
     max_workers: int = 2
     excluded_names: frozenset[str] = field(
         default_factory=lambda: frozenset(
@@ -84,6 +101,8 @@ class ScanEntry:
     classification: str
     reason: str
     risk: str
+    size_status: str = SIZE_STATUS_EXACT
+    scan_depth: str = SCAN_DEPTH_RECURSIVE
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -96,6 +115,8 @@ class ScanEntry:
             "classification": self.classification,
             "reason": self.reason,
             "risk": self.risk,
+            "size_status": self.size_status,
+            "scan_depth": self.scan_depth,
         }
 
 
@@ -113,13 +134,63 @@ def normalize_roots(roots: tuple[str | Path, ...]) -> tuple[Path, ...]:
     return tuple(Path(root).expanduser() for root in roots)
 
 
+class _ProgressThrottle:
+    """Limit hot path progress updates while preserving phase transitions."""
+
+    def __init__(self, callback: ProgressCallback, options: ScanOptions) -> None:
+        self.callback = callback
+        self.interval_seconds = max(0.0, options.progress_interval_seconds)
+        self.interval_entries = max(1, options.progress_interval_entries)
+        self.seen = 0
+        self.last_emitted_seen = 0
+        self.last_emitted_at = 0.0
+        self.emitted_phases: set[str] = set()
+        self.emitted_nonroot_phases: set[str] = set()
+
+    def __call__(self, payload: dict[str, object]) -> None:
+        self.seen += 1
+        phase = str(payload.get("phase", ""))
+        active_path = payload.get("active_path")
+        active_root = payload.get("active_root")
+        is_nonroot_path = active_path is not None and active_path != active_root
+        now = time.monotonic()
+        should_emit = (
+            phase in ALWAYS_EMIT_PHASES
+            or phase not in self.emitted_phases
+            or (is_nonroot_path and phase not in self.emitted_nonroot_phases)
+            or self.seen - self.last_emitted_seen >= self.interval_entries
+            or now - self.last_emitted_at >= self.interval_seconds
+        )
+        if not should_emit:
+            return
+        self.callback(payload)
+        self.last_emitted_seen = self.seen
+        self.last_emitted_at = now
+        self.emitted_phases.add(phase)
+        if is_nonroot_path:
+            self.emitted_nonroot_phases.add(phase)
+
+
+def _throttled_progress(options: ScanOptions, progress: ProgressCallback | None) -> ProgressCallback | None:
+    if progress is None:
+        return None
+    return _ProgressThrottle(progress, options)
+
+
 def scan(options: ScanOptions | None = None, progress: ProgressCallback | None = None) -> ScanResult:
     """Scan configured roots without modifying filesystem state."""
 
     options = options or ScanOptions()
     if not options.read_only:
         raise ValueError("Scanner only supports read-only operation.")
+    if options.mode not in SCAN_MODES:
+        raise ValueError(f"Unsupported scan mode: {options.mode}")
 
+    progress = _throttled_progress(options, progress)
+    if options.mode == SCAN_MODE_LAZY:
+        return _scan_lazy(options, progress)
+    if options.mode == SCAN_MODE_SUMMARY:
+        return _scan_summary(options, progress)
     if options.changed_paths and options.previous_entries:
         return _scan_incremental(options, progress)
     return _scan_full(options, progress)
@@ -268,11 +339,318 @@ def _scan_root_worker(
     return list(entries or []), logs
 
 
+def _scan_summary(options: ScanOptions, progress: ProgressCallback | None = None) -> ScanResult:
+    """Run a shallow scan that returns roots and direct children only."""
+
+    entries: list[ScanEntry] = []
+    logs: list[ScanLog] = []
+    roots = normalize_roots(tuple(options.roots))
+    completed_roots: list[str] = []
+    cached_entries = _cached_entries_by_path(options.previous_entries)
+
+    _emit_progress(
+        progress,
+        phase="starting",
+        active_root=None,
+        active_path=None,
+        completed_roots=[],
+        pending_roots=[str(root) for root in roots],
+        entries_seen=0,
+        logs_seen=0,
+    )
+
+    for index, root in enumerate(roots):
+        _emit_progress(
+            progress,
+            phase="root",
+            active_root=str(root),
+            active_path=str(root),
+            completed_roots=list(completed_roots),
+            pending_roots=[str(item) for item in roots[index:]],
+            entries_seen=len(entries),
+            logs_seen=len(logs),
+        )
+        if _is_denied(root, options.denied_roots):
+            entries.append(_denied_entry(root))
+            logs.append(ScanLog(root, "denied_root", "Skipped denied root."))
+        else:
+            scanned = _scan_summary_path(root, root, options, logs, progress, cached_entries)
+            if scanned is not None:
+                entries.extend(scanned)
+        completed_roots.append(str(root))
+        _emit_progress(
+            progress,
+            phase="root_complete",
+            active_root=str(root),
+            active_path=str(root),
+            completed_roots=list(completed_roots),
+            pending_roots=[str(item) for item in roots[index + 1 :]],
+            entries_seen=len(entries),
+            logs_seen=len(logs),
+        )
+
+    _emit_progress(
+        progress,
+        phase="complete",
+        active_root=None,
+        active_path=None,
+        completed_roots=list(completed_roots),
+        pending_roots=[],
+        entries_seen=len(entries),
+        logs_seen=len(logs),
+    )
+    return ScanResult(tuple(entries), tuple(logs))
+
+
+def _scan_summary_path(
+    path: Path,
+    root: Path,
+    options: ScanOptions,
+    logs: list[ScanLog],
+    progress: ProgressCallback | None,
+    cached_entries: dict[Path, ScanEntry],
+) -> list[ScanEntry] | None:
+    _emit_path_progress(progress, "checking", path, root, logs)
+    stat_result = _stat_path(path, logs)
+    if stat_result is None:
+        return None
+    if stat.S_ISLNK(stat_result.st_mode):
+        logs.append(ScanLog(path, "symlink_skipped", "Skipped symlink."))
+        return None
+    if stat.S_ISDIR(stat_result.st_mode):
+        directory_fd = _open_directory_path(path, logs)
+        if directory_fd is None:
+            return None
+        try:
+            return _scan_summary_directory(
+                path,
+                root,
+                stat_result.st_mtime,
+                directory_fd,
+                options,
+                logs,
+                progress,
+                cached_entries,
+            )
+        finally:
+            os.close(directory_fd)
+
+    modified_at = _datetime_modified(stat_result.st_mtime)
+    classification = classify_path(
+        path,
+        root=root,
+        is_dir=False,
+        size_bytes=stat_result.st_size,
+        modified_at=modified_at,
+    )
+    return [
+        _entry_from_classification(
+            path=path,
+            kind="file",
+            size_bytes=stat_result.st_size,
+            modified_at=modified_at.isoformat(),
+            file_count=None,
+            root=root,
+            classification=classification,
+            scan_depth=SCAN_DEPTH_SHALLOW,
+        )
+    ]
+
+
+def _scan_summary_directory(
+    path: Path,
+    root: Path,
+    modified_timestamp: float,
+    directory_fd: int,
+    options: ScanOptions,
+    logs: list[ScanLog],
+    progress: ProgressCallback | None,
+    cached_entries: dict[Path, ScanEntry],
+) -> list[ScanEntry]:
+    _emit_path_progress(progress, "directory", path, root, logs)
+    child_entries: list[ScanEntry] = []
+    size_bytes = 0
+    file_count = 0
+    unknown_file_count = False
+    child_names = _list_directory_names(directory_fd, path, logs)
+
+    for child_name in child_names:
+        child_path = path / child_name
+        _emit_path_progress(progress, "checking", child_path, root, logs)
+        if _is_denied(child_path, options.denied_roots):
+            logs.append(ScanLog(child_path, "denied_root", "Skipped denied path."))
+            child_entries.append(_denied_entry(child_path, root=root))
+            continue
+
+        stat_result = _stat_child(child_name, child_path, directory_fd, logs)
+        if stat_result is None:
+            unknown_file_count = True
+            continue
+        if stat.S_ISLNK(stat_result.st_mode):
+            logs.append(ScanLog(child_path, "symlink_skipped", "Skipped symlink."))
+            continue
+
+        if stat.S_ISDIR(stat_result.st_mode):
+            cached = _cached_summary_entry(child_path, cached_entries, options)
+            entry = cached or _partial_folder_entry(child_path, root, stat_result.st_mtime)
+            child_entries.append(entry)
+            size_bytes += entry.size_bytes
+            if entry.file_count is None:
+                unknown_file_count = True
+            else:
+                file_count += entry.file_count
+            continue
+
+        modified_at = _datetime_modified(stat_result.st_mtime)
+        classification = classify_path(
+            child_path,
+            root=root,
+            is_dir=False,
+            size_bytes=stat_result.st_size,
+            modified_at=modified_at,
+        )
+        entry = _entry_from_classification(
+            path=child_path,
+            kind="file",
+            size_bytes=stat_result.st_size,
+            modified_at=modified_at.isoformat(),
+            file_count=None,
+            root=root,
+            classification=classification,
+            scan_depth=SCAN_DEPTH_SHALLOW,
+        )
+        child_entries.append(entry)
+        size_bytes += entry.size_bytes
+        file_count += 1
+
+    modified_at = _datetime_modified(modified_timestamp)
+    classification = classify_path(
+        path,
+        root=root,
+        is_dir=True,
+        size_bytes=size_bytes,
+        modified_at=modified_at,
+        source_marker_present=bool(SOURCE_MARKERS.intersection(child_names)),
+    )
+    current = _entry_from_classification(
+        path=path,
+        kind="folder",
+        size_bytes=size_bytes,
+        modified_at=modified_at.isoformat(),
+        file_count=None if unknown_file_count else file_count,
+        root=root,
+        classification=classification,
+        size_status=SIZE_STATUS_PARTIAL,
+        scan_depth=SCAN_DEPTH_SHALLOW,
+    )
+    return [current, *child_entries]
+
+
+def _cached_entries_by_path(items: tuple[dict[str, object], ...]) -> dict[Path, ScanEntry]:
+    entries = [_entry_from_mapping(item) for item in items]
+    return {entry.path: entry for entry in entries if entry is not None}
+
+
+def _cached_summary_entry(
+    path: Path,
+    cached_entries: dict[Path, ScanEntry],
+    options: ScanOptions,
+) -> ScanEntry | None:
+    if not options.reuse_cached_totals:
+        return None
+    cached = cached_entries.get(path)
+    if cached is None or cached.kind != "folder":
+        return None
+    if cached.size_status != SIZE_STATUS_EXACT:
+        return None
+    return ScanEntry(
+        path=cached.path,
+        kind=cached.kind,
+        size_bytes=cached.size_bytes,
+        modified_at=cached.modified_at,
+        file_count=cached.file_count,
+        root=cached.root,
+        classification=cached.classification,
+        reason=cached.reason,
+        risk=cached.risk,
+        size_status=SIZE_STATUS_CACHED,
+        scan_depth=SCAN_DEPTH_SHALLOW,
+    )
+
+
+def _partial_folder_entry(path: Path, root: Path, modified_timestamp: float) -> ScanEntry:
+    modified_at = _datetime_modified(modified_timestamp)
+    classification = classify_path(
+        path,
+        root=root,
+        is_dir=True,
+        size_bytes=0,
+        modified_at=modified_at,
+    )
+    return _entry_from_classification(
+        path=path,
+        kind="folder",
+        size_bytes=0,
+        modified_at=modified_at.isoformat(),
+        file_count=None,
+        root=root,
+        classification=classification,
+        size_status=SIZE_STATUS_PARTIAL,
+        scan_depth=SCAN_DEPTH_SHALLOW,
+    )
+
+
+def _scan_lazy(options: ScanOptions, progress: ProgressCallback | None = None) -> ScanResult:
+    roots = normalize_roots(tuple(options.roots))
+    target, root = _validated_lazy_target(options, roots)
+    logs: list[ScanLog] = []
+    _emit_progress(
+        progress,
+        phase="starting",
+        active_root=str(root),
+        active_path=str(target),
+        completed_roots=[],
+        pending_roots=[str(target)],
+        entries_seen=0,
+        logs_seen=0,
+    )
+    entries = list(_scan_path(target, root, options, logs, progress) or [])
+    _emit_progress(
+        progress,
+        phase="complete",
+        active_root=str(root),
+        active_path=str(target),
+        completed_roots=[str(target)],
+        pending_roots=[],
+        entries_seen=len(entries),
+        logs_seen=len(logs),
+    )
+    return ScanResult(tuple(entries), tuple(logs))
+
+
+def _validated_lazy_target(options: ScanOptions, roots: tuple[Path, ...]) -> tuple[Path, Path]:
+    if options.target_path is None:
+        raise ValueError("Lazy scan requires target_path.")
+    target = Path(options.target_path).expanduser()
+    root = _root_for_path(target, roots)
+    if root is None:
+        raise ValueError("Lazy scan target is outside configured roots.")
+    if _is_denied(target, options.denied_roots):
+        raise ValueError("Lazy scan target is denied.")
+    stat_result = _stat_path(target, [])
+    if stat_result is None:
+        raise ValueError("Lazy scan target is not readable.")
+    if stat.S_ISLNK(stat_result.st_mode):
+        raise ValueError("Lazy scan target is a symlink.")
+    return target, root
+
+
 def _scan_incremental(options: ScanOptions, progress: ProgressCallback | None = None) -> ScanResult:
     roots = normalize_roots(tuple(options.roots))
     changed_paths = _collapse_changed_paths(
         tuple(Path(path).expanduser() for path in options.changed_paths),
         roots,
+        options.excluded_names,
     )
     previous_entries = [
         entry for entry in (_entry_from_mapping(item) for item in options.previous_entries) if entry is not None
@@ -356,9 +734,13 @@ def _scan_changed_path(
     return list(scanned or []), logs
 
 
-def _collapse_changed_paths(paths: tuple[Path, ...], roots: tuple[Path, ...]) -> tuple[Path, ...]:
+def _collapse_changed_paths(
+    paths: tuple[Path, ...],
+    roots: tuple[Path, ...],
+    excluded_names: frozenset[str],
+) -> tuple[Path, ...]:
     in_scope = sorted(
-        {path for path in paths if _root_for_path(path, roots) is not None},
+        {_collapsed_scan_path(path, roots, excluded_names) for path in paths if _root_for_path(path, roots) is not None},
         key=lambda item: (len(item.parts), str(item)),
     )
     collapsed: list[Path] = []
@@ -367,6 +749,18 @@ def _collapse_changed_paths(paths: tuple[Path, ...], roots: tuple[Path, ...]) ->
             continue
         collapsed.append(path)
     return tuple(collapsed)
+
+
+def _collapsed_scan_path(path: Path, roots: tuple[Path, ...], excluded_names: frozenset[str]) -> Path:
+    root = _root_for_path(path, roots)
+    if root is None:
+        return path
+    current = path
+    while current != root:
+        if current.name in excluded_names:
+            return current
+        current = current.parent
+    return root if root.name in excluded_names else path
 
 
 def _merge_incremental_entries(
@@ -383,6 +777,8 @@ def _merge_incremental_entries(
         entries_by_path[entry.path] = entry
 
     for folder_path in _affected_ancestor_paths(changed_paths, roots):
+        if folder_path in changed_paths:
+            continue
         entry = entries_by_path.get(folder_path)
         if entry is None or entry.kind != "folder":
             continue
@@ -462,6 +858,8 @@ def _entry_from_mapping(data: dict[str, object]) -> ScanEntry | None:
             classification=str(data.get("classification", "do_not_touch")),
             reason=str(data.get("reason", "unclassified")),
             risk=str(data.get("risk", "high")),
+            size_status=str(data.get("size_status", SIZE_STATUS_EXACT)),
+            scan_depth=str(data.get("scan_depth", SCAN_DEPTH_RECURSIVE)),
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -601,6 +999,8 @@ def _entry_from_classification(
     file_count: int | None,
     root: Path,
     classification: Classification,
+    size_status: str = SIZE_STATUS_EXACT,
+    scan_depth: str = SCAN_DEPTH_RECURSIVE,
 ) -> ScanEntry:
     return ScanEntry(
         path=path,
@@ -612,6 +1012,8 @@ def _entry_from_classification(
         classification=classification.classification,
         reason=classification.reason,
         risk=classification.risk,
+        size_status=size_status,
+        scan_depth=scan_depth,
     )
 
 

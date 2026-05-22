@@ -32,11 +32,60 @@ class CapturingScanner:
     def __init__(self) -> None:
         self.calls = 0
         self.options = None
+        self.options_seen = []
 
     def scan(self, options=None, progress=None):
         self.calls += 1
         self.options = options
+        self.options_seen.append(options)
         return {"entries": [], "logs": []}
+
+
+class TwoPhaseScanner:
+    def __init__(self) -> None:
+        self.summary_done = threading.Event()
+        self.release_exact = threading.Event()
+        self.options_seen = []
+
+    def scan(self, options=None, progress=None):
+        self.options_seen.append(options)
+        if getattr(options, "mode", None) == "summary":
+            self.summary_done.set()
+            return {
+                "entries": [
+                    {
+                        "path": str(options.roots[0]),
+                        "kind": "folder",
+                        "size_bytes": 0,
+                        "file_count": None,
+                        "root": str(options.roots[0]),
+                        "classification": "do_not_touch",
+                        "reason": "unclassified",
+                        "risk": "high",
+                        "size_status": "partial",
+                        "scan_depth": "shallow",
+                    }
+                ],
+                "logs": [],
+            }
+        self.release_exact.wait(timeout=2)
+        return {
+            "entries": [
+                {
+                    "path": str(options.roots[0]),
+                    "kind": "folder",
+                    "size_bytes": 10,
+                    "file_count": 1,
+                    "root": str(options.roots[0]),
+                    "classification": "do_not_touch",
+                    "reason": "unclassified",
+                    "risk": "high",
+                    "size_status": "exact",
+                    "scan_depth": "recursive",
+                }
+            ],
+            "logs": [],
+        }
 
 
 class FakeFSEvents:
@@ -188,6 +237,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(scanner.calls, 1)
         self.assertEqual(scanner.options.changed_paths, (dirty,))
         self.assertEqual(scanner.options.previous_entries, tuple(snapshot["entries"]))
+        self.assertEqual(scanner.options.mode, "exact")
         self.assertEqual(result["fsevents_event_id"], 102)
         self.assertEqual(result["fsevents_roots_fingerprint"], roots_fingerprint(runtime.roots))
 
@@ -206,9 +256,33 @@ class RuntimeTests(unittest.TestCase):
 
             runtime.run_scan()
 
-        self.assertEqual(scanner.calls, 1)
+        self.assertEqual(scanner.calls, 2)
+        self.assertEqual([option.mode for option in scanner.options_seen], ["summary", "exact"])
         self.assertEqual(scanner.options.changed_paths, ())
         self.assertEqual(scanner.options.previous_entries, ())
+
+    def test_two_phase_scan_publishes_partial_snapshot_before_exact_completion(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            scanner = TwoPhaseScanner()
+            runtime = self.runtime(temp_dir, scanner=scanner, fsevents=FakeFSEvents(supported=False))
+            thread = threading.Thread(target=runtime.run_scan)
+            thread.start()
+            scanner.summary_done.wait(timeout=1)
+            partial = None
+            deadline = time.monotonic() + 1
+            while partial is None and time.monotonic() < deadline:
+                partial = runtime.store.latest()
+                time.sleep(0.01)
+            scanner.release_exact.set()
+            thread.join(timeout=2)
+            exact = runtime.store.latest()
+
+        self.assertIsNotNone(partial)
+        self.assertEqual(partial["snapshot_status"], "partial")
+        self.assertEqual(partial["entries"][0]["size_status"], "partial")
+        self.assertEqual(exact["snapshot_status"], "exact")
+        self.assertEqual(exact["entries"][0]["size_status"], "exact")
+        self.assertEqual([option.mode for option in scanner.options_seen], ["summary", "exact"])
 
 
 class EmptyScanner:

@@ -49,6 +49,9 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/scan/path":
+            self._handle_path_scan()
+            return
         if path != "/api/scan":
             self._send_json({"error": "not_found"}, status=404)
             return
@@ -62,6 +65,25 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
             self._send_json({"error": "scan_failed", "status": "failed"}, status=500)
             return
         self._send_json({"status": "completed", "snapshot": snapshot}, status=202)
+
+    def _handle_path_scan(self) -> None:
+        body = self._read_json_body()
+        raw_path = body.get("path") if isinstance(body, dict) else None
+        if not isinstance(raw_path, str) or not raw_path:
+            self._send_json({"error": "invalid_scan_path"}, status=400)
+            return
+        try:
+            result = self.server.run_path_scan(Path(raw_path))
+        except ValueError:
+            self._send_json({"error": "invalid_scan_path"}, status=400)
+            return
+        except ScanAlreadyRunningError:
+            self._send_json({"error": "scan_already_running", "status": "running"}, status=409)
+            return
+        except Exception:
+            self._send_json({"error": "scan_failed", "status": "failed"}, status=500)
+            return
+        self._send_json({"status": "completed", **result}, status=202)
 
     def do_HEAD(self) -> None:
         path = urlparse(self.path).path
@@ -114,6 +136,19 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
         }
         self._send_json({"report": report})
 
+    def _read_json_body(self) -> dict[str, object] | None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return None
+        if length <= 0 or length > 4096:
+            return None
+        try:
+            data = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
     def _send_json(self, payload: dict[str, object], status: int = 200, *, include_body: bool = True) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -156,6 +191,9 @@ class DashboardServer(ThreadingHTTPServer):
     def run_scan(self) -> dict[str, object]:
         return self.runtime.run_scan()
 
+    def run_path_scan(self, path: Path) -> dict[str, object]:
+        return self.runtime.run_path_scan(path)
+
 
 def create_server(
     host: str = "127.0.0.1",
@@ -195,6 +233,8 @@ def suggestions_from_snapshot(snapshot: dict[str, object] | None) -> list[dict[s
             continue
         classification = entry.get("classification")
         if classification not in SUGGESTION_CLASSES:
+            continue
+        if entry.get("size_status") in {"cached", "partial"}:
             continue
         size_bytes = _coerce_size_bytes(entry.get("size_bytes", 0))
         suggestions.append(

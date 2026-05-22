@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from storage_dashboard.server import DashboardRequestHandler, create_server, main
+from storage_dashboard.runtime import ScanRuntime
 from storage_dashboard.store import SnapshotStore
 
 
@@ -91,10 +92,18 @@ class ProgressScanner:
 
 
 class ApiTests(unittest.TestCase):
-    def request(self, server, method: str, path: str) -> tuple[int, dict[str, object]]:
+    def request(
+        self,
+        server,
+        method: str,
+        path: str,
+        body: dict[str, object] | None = None,
+    ) -> tuple[int, dict[str, object]]:
         connection = HTTPConnection(server.server_address[0], server.server_address[1], timeout=2)
         try:
-            connection.request(method, path)
+            payload = json.dumps(body).encode("utf-8") if body is not None else None
+            headers = {"Content-Type": "application/json"} if body is not None else {}
+            connection.request(method, path, body=payload, headers=headers)
             response = connection.getresponse()
             body = response.read().decode("utf-8")
             return response.status, json.loads(body)
@@ -248,6 +257,48 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(results_payload["error"], "no_scan_results")
         self.assertEqual(export_status, 404)
         self.assertEqual(export_payload["error"], "no_scan_results")
+
+    def test_lazy_scan_path_rejects_out_of_root_path(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "root"
+            outside = Path(temp_dir) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            store = SnapshotStore(Path(temp_dir) / "state.json")
+            runtime = ScanRuntime(store=store, scanner=FakeScanner(), disk_path=Path(temp_dir), roots=(root,))
+            server = create_server("127.0.0.1", 0, store=store, runtime=runtime)
+            thread = self.serve(server)
+            try:
+                status, payload = self.request(server, "POST", "/api/scan/path", {"path": str(outside)})
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
+
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"], "invalid_scan_path")
+
+    def test_lazy_scan_path_returns_requested_subtree_entries(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "root"
+            project = root / "project"
+            project.mkdir(parents=True)
+            (project / "data.bin").write_bytes(b"123")
+            store = SnapshotStore(Path(temp_dir) / "state.json")
+            runtime = ScanRuntime(store=store, disk_path=Path(temp_dir), roots=(root,))
+            server = create_server("127.0.0.1", 0, store=store, runtime=runtime)
+            thread = self.serve(server)
+            try:
+                status, payload = self.request(server, "POST", "/api/scan/path", {"path": str(project)})
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
+
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["path"], str(project))
+        self.assertEqual({entry["path"] for entry in payload["entries"]}, {str(project), str(project / "data.bin")})
 
     def test_unknown_api_path_returns_json_404(self) -> None:
         with TemporaryDirectory() as temp_dir:

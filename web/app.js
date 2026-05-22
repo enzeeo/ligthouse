@@ -254,7 +254,7 @@ function renderOverview() {
     <article class="panel wide">
       <div class="panel-head"><h2>Roots</h2><span>top 3 by scanned bytes</span></div>
       <div class="panel-body stack">
-        ${roots.length ? roots.map((root) => meter(root.path, root.percent, formatBytes(root.size), "green")).join("") : empty("No scan yet. Run Scan to populate root meters.")}
+        ${roots.length ? roots.map((root) => meter(root.path, root.percent, formatEntrySize(root), "green")).join("") : empty("No scan yet. Run Scan to populate root meters.")}
       </div>
     </article>
     ${renderScanDebug(roots)}
@@ -413,7 +413,7 @@ function renderSuggestionRow(item) {
         <div class="path">${escapeHtml(path || "unknown path")}</div>
         <div class="reason ${riskClass(item.classification)}">${escapeHtml(item.reason || "No reason supplied")}</div>
       </div>
-      <div class="value">${formatBytes(item.size_bytes ?? item.size)}</div>
+      <div class="value">${formatEntrySize(item)}</div>
     </button>
   `;
 }
@@ -425,7 +425,7 @@ function renderEntryRow(entry) {
         <div class="path">${escapeHtml(entry.path || "unknown path")}</div>
         <div class="reason ${riskClass(entry.classification)}">${escapeHtml(entry.classification || "unknown")} | ${escapeHtml(entry.reason || "No reason supplied")}</div>
       </div>
-      <div class="value">${formatBytes(entry.size_bytes)}</div>
+      <div class="value">${formatEntrySize(entry)}</div>
     </div>
   `;
 }
@@ -442,7 +442,7 @@ function renderFolderRow(entry, max) {
         </div>
         ${meter("", percent, "", "cyan")}
       </div>
-      <div class="value">${formatBytes(entry.size_bytes)}</div>
+      <div class="value">${formatEntrySize(entry)}</div>
     </div>
   `;
 }
@@ -464,7 +464,7 @@ function renderDetail(item) {
     <div class="detail">
       <div class="detail-path">${escapeHtml(item.path || "unknown path")}</div>
       <div class="detail-grid">
-        <div class="cell-muted">Size</div><div>${formatBytes(item.size_bytes ?? item.size)}</div>
+        <div class="cell-muted">Size</div><div>${formatEntrySize(item)}</div>
         <div class="cell-muted">Kind</div><div>${escapeHtml(item.kind || "unknown")}</div>
         <div class="cell-muted">Class</div><div class="${riskClass(item.classification)}">${escapeHtml(item.classification || "unknown")}</div>
         <div class="cell-muted">Risk</div><div class="${riskClass(item.risk)}">${escapeHtml(item.risk || "unknown")}</div>
@@ -610,7 +610,7 @@ function rootSummaries() {
       : state.entries
           .filter((entry) => entry.root === root && entry.kind === "file")
           .reduce((sum, entry) => sum + sizeOf(entry), 0);
-    return { path: root, size };
+    return { path: root, size, size_bytes: size, size_status: rootEntry ? rootEntry.size_status : "partial" };
   });
   const max = Math.max(1, ...totals.map((root) => root.size));
   return totals
@@ -760,6 +760,12 @@ function bySizeDesc(a, b) {
 
 function sizeOf(entry) {
   return Number(entry && entry.size_bytes) || 0;
+}
+
+function formatEntrySize(entry) {
+  const status = entry && typeof entry.size_status === "string" ? entry.size_status : "exact";
+  const suffix = status === "partial" || status === "cached" ? ` ${status}` : "";
+  return `${formatBytes(entry && (entry.size_bytes ?? entry.size))}${suffix}`;
 }
 
 function number(value) {

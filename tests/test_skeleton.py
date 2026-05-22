@@ -60,6 +60,26 @@ class SkeletonTests(unittest.TestCase):
         self.assertTrue(any(event.get("active_path") == str(folder) for event in events))
         self.assertEqual(events[-1]["entries_seen"], len(result.entries))
 
+    def test_scanner_throttles_repeated_path_progress(self) -> None:
+        events = []
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for index in range(20):
+                (root / f"{index}.bin").write_bytes(b"x")
+
+            scan(
+                ScanOptions(
+                    roots=(root,),
+                    progress_interval_seconds=999,
+                    progress_interval_entries=10,
+                ),
+                progress=events.append,
+            )
+
+        file_events = [event for event in events if event.get("phase") == "file"]
+        self.assertLess(len(file_events), 20)
+        self.assertEqual(events[-1]["phase"], "complete")
+
     def test_unknown_classifier_defaults_to_do_not_touch(self) -> None:
         classification = classify_path("example.txt")
 
@@ -179,6 +199,73 @@ class SkeletonTests(unittest.TestCase):
         self.assertEqual(root_entry.file_count, 2)
         self.assertEqual(nested_entry.size_bytes, 4)
         self.assertEqual(nested_entry.file_count, 1)
+        self.assertEqual(root_entry.size_status, "exact")
+        self.assertEqual(root_entry.scan_depth, "recursive")
+
+    def test_summary_scan_returns_root_and_direct_children_only(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            nested = root / "nested"
+            nested.mkdir()
+            (root / "one.bin").write_bytes(b"123")
+            (nested / "two.bin").write_bytes(b"4567")
+
+            result = scan(ScanOptions(roots=(root,), mode="summary"))
+
+        by_path = {entry.path: entry for entry in result.entries}
+        self.assertIn(root, by_path)
+        self.assertIn(root / "one.bin", by_path)
+        self.assertIn(nested, by_path)
+        self.assertNotIn(nested / "two.bin", by_path)
+        self.assertEqual(by_path[root].size_bytes, 3)
+        self.assertEqual(by_path[root].size_status, "partial")
+        self.assertEqual(by_path[nested].size_status, "partial")
+        self.assertEqual(by_path[nested].scan_depth, "shallow")
+
+    def test_lazy_scan_rejects_out_of_scope_and_symlink_targets(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "root"
+            outside = Path(temp_dir) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            target = root / "target"
+            target.mkdir()
+            link = root / "linked"
+            link.symlink_to(target, target_is_directory=True)
+
+            with self.assertRaises(ValueError):
+                scan(ScanOptions(roots=(root,), mode="lazy", target_path=outside))
+            with self.assertRaises(ValueError):
+                scan(ScanOptions(roots=(root,), mode="lazy", target_path=link))
+
+    def test_summary_scan_reuses_cached_collapsed_folder_totals(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            node_modules = root / "node_modules"
+            nested = node_modules / "package"
+            nested.mkdir(parents=True)
+            (nested / "index.js").write_bytes(b"1234")
+            cached = {
+                "path": str(node_modules),
+                "kind": "folder",
+                "size_bytes": 99,
+                "modified_at": None,
+                "file_count": 12,
+                "root": str(root),
+                "classification": CLASS_SAFE_TO_REVIEW,
+                "reason": "build output folder",
+                "risk": "low",
+                "size_status": "exact",
+                "scan_depth": "recursive",
+            }
+
+            result = scan(ScanOptions(roots=(root,), mode="summary", previous_entries=(cached,)))
+
+        by_path = {entry.path: entry for entry in result.entries}
+        self.assertEqual(by_path[node_modules].size_bytes, 99)
+        self.assertEqual(by_path[node_modules].file_count, 12)
+        self.assertEqual(by_path[node_modules].size_status, "cached")
+        self.assertEqual(by_path[root].size_bytes, 99)
 
     def test_scanner_passes_source_marker_presence_from_safe_directory_listing(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -210,6 +297,30 @@ class SkeletonTests(unittest.TestCase):
         self.assertEqual(node_modules_entry.file_count, 2)
         self.assertEqual(node_modules_entry.classification, CLASS_SAFE_TO_REVIEW)
         self.assertFalse(any(entry.path.name == "nested.js" for entry in result.entries))
+
+    def test_incremental_change_inside_collapsed_folder_rescans_collapsed_folder(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            node_modules = root / "node_modules"
+            package = node_modules / "package"
+            package.mkdir(parents=True)
+            changed = package / "index.js"
+            changed.write_bytes(b"12")
+            baseline = scan(ScanOptions(roots=(root,)))
+
+            changed.write_bytes(b"123456")
+            result = scan(
+                ScanOptions(
+                    roots=(root,),
+                    changed_paths=(changed,),
+                    previous_entries=tuple(entry.to_dict() for entry in baseline.entries),
+                )
+            )
+
+        node_modules_entry = next(entry for entry in result.entries if entry.path == node_modules)
+        root_entry = next(entry for entry in result.entries if entry.path == root)
+        self.assertEqual(node_modules_entry.size_bytes, 6)
+        self.assertEqual(root_entry.size_bytes, 6)
 
     def test_scanner_skips_symlinks_inside_collapsed_measured_folder(self) -> None:
         with TemporaryDirectory() as temp_dir:

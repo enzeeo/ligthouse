@@ -68,6 +68,7 @@ class SnapshotStore:
         roots_fingerprint: str | None = None,
         fsevents_event_id: int | None = None,
         fsevents_roots_fingerprint: str | None = None,
+        snapshot_status: str | None = None,
     ) -> dict[str, object]:
         with self._lock:
             data = self._load_unlocked()
@@ -89,6 +90,8 @@ class SnapshotStore:
                 snapshot["fsevents_event_id"] = fsevents_event_id
             if fsevents_roots_fingerprint is not None:
                 snapshot["fsevents_roots_fingerprint"] = fsevents_roots_fingerprint
+            if snapshot_status is not None:
+                snapshot["snapshot_status"] = snapshot_status
             snapshots.append(snapshot)
             data["snapshots"] = snapshots[-self.limit :]
             self.path.parent.mkdir(parents=True, exist_ok=True)
